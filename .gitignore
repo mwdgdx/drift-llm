@@ -1,0 +1,42 @@
+# Submodule repos (other people's code)
+/drifting/
+/dllm/
+
+# Models and data (large files)
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+models/
+data/
+runs/
+
+# PDF
+*.pdf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Env
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# WandB
+wandb/
