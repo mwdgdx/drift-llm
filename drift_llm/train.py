@@ -57,7 +57,7 @@ class TrainConfig:
 
     lambda_ce: float = 0.1
     lambda_drift: float = 1.0
-    R_list: Tuple[float, ...] = (0.02, 0.05, 0.2)
+    R_list: Tuple[float, ...] = (0.5, 1.0, 2.0)
 
     multiscale_chunks: Tuple[int, ...] = (32,)
     drift_scales: Tuple[str, ...] = ("per_token", "global")
