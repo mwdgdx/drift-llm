@@ -9,6 +9,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 MODEL_DIR="${MODEL_DIR:-$PROJECT_DIR/models}"
 
+# --- Databricks PyPI proxy ---
+export PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi-proxy.dev.databricks.com/simple/}"
+export UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi-proxy.dev.databricks.com/simple/}"
+
 # --- Defaults (override via environment variables) ---
 GENERATOR="${GENERATOR:-$MODEL_DIR/LLaDA-8B-Base}"
 FEATURE_ENCODER="${FEATURE_ENCODER:-}"        # empty = no Feature LLM (Level 1)

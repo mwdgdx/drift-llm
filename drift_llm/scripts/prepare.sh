@@ -17,8 +17,12 @@ echo "  Models:   $MODEL_DIR"
 echo "  Data:     $DATA_DIR"
 echo "============================================"
 
+# --- Databricks PyPI proxy (MCT clusters block PyPI directly) ---
+export PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi-proxy.dev.databricks.com/simple/}"
+export UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi-proxy.dev.databricks.com/simple/}"
+
 # --- 1. Install dependencies ---
-echo "[1/5] Installing Python dependencies..."
+echo "[1/5] Installing Python dependencies (via $PIP_INDEX_URL)..."
 pip install -r "$PROJECT_DIR/requirements.txt"
 
 # --- 2. WandB login ---
