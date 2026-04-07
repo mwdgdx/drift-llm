@@ -450,30 +450,58 @@ def train(config: TrainConfig):
         if step % config.save_every == 0:
             save_checkpoint(generator, optimizer, scheduler, step, config)
 
-        # --- Quick eval ---
+        # --- Eval (always compute, regardless of loss config) ---
         if step % config.eval_every == 0:
             eval_metrics = {}
             with torch.no_grad():
+                # --- Eval on current batch: one-step generate vs GT ---
+                eval_result = generator.forward(
+                    prompt_ids=prompt_ids, response_length=T_r,
+                )
+                eval_logits = eval_result["logits"]  # [B, T_r, V]
+                eval_tokens = eval_logits.argmax(dim=-1)  # [B, T_r]
+
+                # Token accuracy: what fraction of positions match GT?
+                match = (eval_tokens == response_ids).float()
+                masked_match = match * response_mask.float()
+                token_acc = masked_match.sum() / response_mask.sum().clamp(min=1)
+                eval_metrics["eval/token_accuracy"] = token_acc.item()
+
+                # Eval CE loss (always computed, even when lambda_ce=0)
+                eval_ce = F.cross_entropy(
+                    eval_logits.reshape(-1, eval_logits.size(-1)),
+                    response_ids.reshape(-1),
+                    reduction="none",
+                )
+                eval_ce = (eval_ce * response_mask.reshape(-1).float()).sum() / response_mask.sum().clamp(min=1)
+                eval_metrics["eval/ce_loss"] = eval_ce.item()
+
+                # Sample text
                 sample_prompt = prompt_ids[:1]
                 tokens = generator.generate(sample_prompt, T_r)
-                text = tokenizer.decode(tokens[0], skip_special_tokens=True)
-                logger.info(f"[Eval step={step}] Sample: {text[:200]}")
+                generated_text = tokenizer.decode(tokens[0], skip_special_tokens=True)
+                gt_text = tokenizer.decode(response_ids[0], skip_special_tokens=True)
+                logger.info(f"[Eval step={step}] GT:        {gt_text[:200]}")
+                logger.info(f"[Eval step={step}] Generated: {generated_text[:200]}")
 
-                if G >= 2:
-                    diversity_tokens = []
-                    for _ in range(4):
-                        t = generator.generate(sample_prompt, T_r)
-                        diversity_tokens.append(t[0])
-                    diversity_tokens = torch.stack(diversity_tokens)
-                    n = diversity_tokens.shape[0]
-                    agree = sum(
-                        (diversity_tokens[i] == diversity_tokens[j]).float().mean().item()
-                        for i in range(n) for j in range(i+1, n)
-                    ) / max(1, n * (n-1) / 2)
-                    eval_metrics["eval/token_agreement"] = agree
-                    logger.info(f"[Eval step={step}] Token agreement (lower=more diverse): {agree:.3f}")
+                # Diversity: different noise → different output?
+                diversity_tokens = []
+                for _ in range(4):
+                    t = generator.generate(sample_prompt, T_r)
+                    diversity_tokens.append(t[0])
+                diversity_tokens = torch.stack(diversity_tokens)
+                n = diversity_tokens.shape[0]
+                agree = sum(
+                    (diversity_tokens[i] == diversity_tokens[j]).float().mean().item()
+                    for i in range(n) for j in range(i+1, n)
+                ) / max(1, n * (n-1) / 2)
+                eval_metrics["eval/token_agreement"] = agree
 
-            if wandb_run and eval_metrics:
+                logger.info(f"[Eval step={step}] Token acc: {token_acc.item():.3f}  "
+                           f"CE: {eval_ce.item():.3f}  "
+                           f"Diversity (1-agreement): {1-agree:.3f}")
+
+            if wandb_run:
                 wandb_run.log(eval_metrics, step=step)
 
     logger.info("Training complete!")
