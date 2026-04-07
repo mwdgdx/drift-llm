@@ -81,15 +81,13 @@ def get_tau(step: int, config: TrainConfig) -> float:
 
 
 def load_generator(config: TrainConfig, device: torch.device) -> OneStepGenerator:
-    import sys
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dllm"))
-    from dllm.pipelines.llada.models.modeling_llada import LLaDAModelLM
-    from dllm.pipelines.llada.models.configuration_llada import LLaDAConfig
+    from transformers import AutoModelForCausalLM
 
     logger.info(f"Loading generator: {config.model_name}")
-    model = LLaDAModelLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
+        trust_remote_code=True,
     )
     model.to(device)
     return OneStepGenerator(model)
