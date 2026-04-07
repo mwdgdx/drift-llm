@@ -27,10 +27,10 @@ pip install -r "$PROJECT_DIR/requirements.txt"
 
 # --- 2. WandB login ---
 echo "[2/5] WandB login..."
-if python -c "import wandb; wandb.api.api_key" 2>/dev/null; then
-    echo "  Already logged in"
+if python -c "import wandb; assert wandb.api.default_entity is not None" 2>/dev/null; then
+    echo "  Already logged in as: $(python -c 'import wandb; print(wandb.api.default_entity)')"
 else
-    echo "  Run: wandb login"
+    echo "  Not logged in. Running: wandb login"
     wandb login
 fi
 
