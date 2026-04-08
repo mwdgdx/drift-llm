@@ -504,9 +504,86 @@ def train(config: TrainConfig):
             if wandb_run:
                 wandb_run.log(eval_metrics, step=step)
 
-    logger.info("Training complete!")
+    logger.info("Training complete! Running final evaluation...")
     save_checkpoint(generator, optimizer, scheduler, step, config)
+
+    # --- Final evaluation on multiple batches ---
+    generator.model.eval()
+    final_metrics = {"token_acc": [], "ce_loss": [], "token_agreement": []}
+    n_eval_batches = 50
+    eval_iter = iter(dataloader)
+
+    with torch.no_grad():
+        for i in range(n_eval_batches):
+            try:
+                batch = next(eval_iter)
+            except StopIteration:
+                eval_iter = iter(dataloader)
+                batch = next(eval_iter)
+
+            p_ids = batch["prompt_ids"].to(device)
+            r_ids = batch["response_ids"].to(device)
+            r_mask = batch["response_mask"].to(device)
+            T_r_eval = r_ids.shape[1]
+
+            result = generator.forward(prompt_ids=p_ids, response_length=T_r_eval)
+            logits_eval = result["logits"]
+            tokens_eval = logits_eval.argmax(dim=-1)
+
+            match = (tokens_eval == r_ids).float() * r_mask.float()
+            acc = match.sum() / r_mask.sum().clamp(min=1)
+            final_metrics["token_acc"].append(acc.item())
+
+            ce = F.cross_entropy(
+                logits_eval.reshape(-1, logits_eval.size(-1)),
+                r_ids.reshape(-1),
+                reduction="none",
+            )
+            ce = (ce * r_mask.reshape(-1).float()).sum() / r_mask.sum().clamp(min=1)
+            final_metrics["ce_loss"].append(ce.item())
+
+            # Diversity on first prompt
+            if i == 0:
+                div_tokens = [generator.generate(p_ids[:1], T_r_eval) for _ in range(8)]
+                div_tokens = torch.stack([t[0] for t in div_tokens])
+                n = div_tokens.shape[0]
+                agree = sum(
+                    (div_tokens[j] == div_tokens[k]).float().mean().item()
+                    for j in range(n) for k in range(j+1, n)
+                ) / max(1, n * (n-1) / 2)
+                final_metrics["token_agreement"].append(agree)
+
+        # Print 5 samples
+        logger.info(f"\n{'='*60}")
+        logger.info("FINAL EVALUATION SAMPLES")
+        logger.info(f"{'='*60}")
+        for s in range(min(5, p_ids.shape[0])):
+            gen_text = tokenizer.decode(tokens_eval[s], skip_special_tokens=True)
+            gt_text = tokenizer.decode(r_ids[s], skip_special_tokens=True)
+            prompt_text = tokenizer.decode(p_ids[s], skip_special_tokens=True)
+            logger.info(f"\nPrompt:    {prompt_text[:100]}")
+            logger.info(f"GT:        {gt_text[:200]}")
+            logger.info(f"Generated: {gen_text[:200]}")
+
+    avg_acc = sum(final_metrics["token_acc"]) / len(final_metrics["token_acc"])
+    avg_ce = sum(final_metrics["ce_loss"]) / len(final_metrics["ce_loss"])
+    avg_agree = sum(final_metrics["token_agreement"]) / max(1, len(final_metrics["token_agreement"]))
+
+    logger.info(f"\n{'='*60}")
+    logger.info("FINAL RESULTS")
+    logger.info(f"{'='*60}")
+    logger.info(f"  Token accuracy:   {avg_acc:.4f}")
+    logger.info(f"  CE loss:          {avg_ce:.4f}")
+    logger.info(f"  Token agreement:  {avg_agree:.4f}  (lower = more diverse)")
+    logger.info(f"  Diversity:        {1-avg_agree:.4f}")
+
     if wandb_run:
+        wandb_run.log({
+            "final/token_accuracy": avg_acc,
+            "final/ce_loss": avg_ce,
+            "final/token_agreement": avg_agree,
+            "final/diversity": 1 - avg_agree,
+        })
         wandb_run.finish()
 
 
