@@ -193,6 +193,7 @@ def main():
     p.add_argument("--diffusion_steps", type=int, default=50)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--dataset", type=str, default="owt", choices=["owt", "alpaca"])
+    p.add_argument("--wandb_project", default=None, help="WandB project for logging eval results")
     args = p.parse_args()
 
     if args.labels is None:
@@ -272,6 +273,45 @@ def main():
 
     logger.info(f"\n(Gen. PPL measured by {args.ppl_model}; lower is better)")
     logger.info("(Entropy: higher is better, data-level ~4.3 LM1B / ~5.4 OWT)")
+
+    # --- Log to WandB ---
+    if args.wandb_project:
+        import wandb
+        wandb.init(project=args.wandb_project, name="eval_comparison", config=vars(args))
+
+        # Summary table
+        columns = ["Method", "Mode", "Gen.PPL", "Entropy", "TokAcc", "Dist-1", "Dist-2", "Rep"]
+        table = wandb.Table(columns=columns)
+
+        for label, results in all_results.items():
+            for mode in ["1step", "multi"]:
+                r = results[mode]
+                mode_label = "1-step" if mode == "1step" else "multi"
+                table.add_data(
+                    label, mode_label,
+                    r["gen_ppl"], r["entropy"],
+                    avg(r["metrics"], "acc"),
+                    avg(r["metrics"], "d1"), avg(r["metrics"], "d2"),
+                    avg(r["metrics"], "rep"),
+                )
+                wandb.summary[f"{label}/{mode_label}/gen_ppl"] = r["gen_ppl"]
+                wandb.summary[f"{label}/{mode_label}/entropy"] = r["entropy"]
+                wandb.summary[f"{label}/{mode_label}/tok_acc"] = avg(r["metrics"], "acc")
+                wandb.summary[f"{label}/{mode_label}/dist1"] = avg(r["metrics"], "d1")
+                wandb.summary[f"{label}/{mode_label}/dist2"] = avg(r["metrics"], "d2")
+                wandb.summary[f"{label}/{mode_label}/rep"] = avg(r["metrics"], "rep")
+
+        wandb.log({"eval/comparison": table})
+
+        # Log sample generations
+        for label, results in all_results.items():
+            sample_table = wandb.Table(columns=["text"])
+            for text in results["1step"]["texts"][:20]:
+                sample_table.add_data(text)
+            wandb.log({f"eval/{label}_1step_samples": sample_table})
+
+        wandb.finish()
+        logger.info("Eval results logged to WandB.")
 
 
 if __name__ == "__main__":

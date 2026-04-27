@@ -104,6 +104,11 @@ echo ""
 CE_CKPT="runs/v2_ce_only/step_${CE_STEPS}.pt"
 DRIFT_CKPT="runs/v2_drift_feat/step_${DRIFT_STEPS}.pt"
 
+EVAL_WANDB_ARG=""
+if [ -n "$WANDB" ]; then
+    EVAL_WANDB_ARG="--wandb_project $WANDB"
+fi
+
 python eval_compare.py \
     --checkpoints "$CE_CKPT" "$DRIFT_CKPT" \
     --labels "CE-only(1step)" "Drift+Feat(1step)" \
@@ -111,7 +116,8 @@ python eval_compare.py \
     --dataset $DATASET \
     --ppl_model gpt2-large \
     --n_eval 200 \
-    --diffusion_steps $DIFF_STEPS
+    --diffusion_steps $DIFF_STEPS \
+    $EVAL_WANDB_ARG
 
 echo ""
 echo "============================================"
