@@ -1,9 +1,19 @@
-"""Shared data loading for all training methods."""
+"""
+Shared data loading for all training methods.
+
+Supports:
+  - Alpaca (instruction → response, for small/debug experiments)
+  - OpenWebText (unconditional LM, packed sequences, for scaled experiments)
+"""
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from datasets import load_dataset
 
+
+# ---------------------------------------------------------------------------
+# Alpaca: instruction-following (conditional generation)
+# ---------------------------------------------------------------------------
 
 def load_alpaca(tokenizer, max_prompt_len=128, max_response_len=64):
     ds = load_dataset("tatsu-lab/alpaca", split="train")
@@ -57,3 +67,74 @@ def make_dataloader(ds, tokenizer, batch_size, max_prompt_len=128, max_response_
     fn = partial(collate_fn, pad_token_id=tokenizer.pad_token_id,
                  max_prompt_len=max_prompt_len, max_response_len=max_response_len)
     return DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=fn, drop_last=True)
+
+
+# ---------------------------------------------------------------------------
+# OpenWebText: unconditional LM with sequence packing (for scaled experiments)
+# ---------------------------------------------------------------------------
+
+class PackedOWTDataset(IterableDataset):
+    """
+    Streams OpenWebText and packs tokens into fixed-length sequences.
+    For unconditional LM: the entire sequence is the "response" (no prompt).
+    We use a short dummy prompt (BOS) so the Generator API stays consistent.
+    """
+
+    def __init__(self, tokenizer, seq_len=128, buffer_size=100_000, seed=42):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.buffer_size = buffer_size
+        self.seed = seed
+
+    def __iter__(self):
+        import itertools
+        worker_info = torch.utils.data.get_worker_info()
+        worker_seed = self.seed + (worker_info.id if worker_info else 0)
+
+        ds = load_dataset("Skylion007/openwebtext", split="train", streaming=True,
+                          trust_remote_code=True)
+        ds = ds.shuffle(seed=worker_seed, buffer_size=self.buffer_size)
+
+        token_buffer = []
+        eos_id = self.tokenizer.eos_token_id or 0
+
+        for example in itertools.cycle(ds):
+            text = example.get("text", "")
+            if not text:
+                continue
+            ids = self.tokenizer(text, add_special_tokens=False, return_tensors=None)["input_ids"]
+            token_buffer.extend(ids)
+            token_buffer.append(eos_id)
+
+            while len(token_buffer) >= self.seq_len:
+                chunk = token_buffer[:self.seq_len]
+                token_buffer = token_buffer[self.seq_len:]
+                yield {
+                    "input_ids": torch.tensor(chunk, dtype=torch.long),
+                }
+
+
+def owt_collate_fn(batch, bos_token_id):
+    """
+    For unconditional LM: prompt is just [BOS], response is the packed sequence.
+    """
+    B = len(batch)
+    seq_len = batch[0]["input_ids"].shape[0]
+
+    prompt_ids = torch.full((B, 1), bos_token_id, dtype=torch.long)
+    response_ids = torch.stack([item["input_ids"] for item in batch])
+    response_mask = torch.ones(B, seq_len, dtype=torch.bool)
+
+    return {"prompt_ids": prompt_ids, "response_ids": response_ids, "response_mask": response_mask}
+
+
+def make_owt_dataloader(tokenizer, batch_size, seq_len=128, num_workers=4):
+    from functools import partial
+    bos_id = tokenizer.bos_token_id
+    if bos_id is None:
+        bos_id = tokenizer.eos_token_id
+    ds = PackedOWTDataset(tokenizer, seq_len=seq_len)
+    fn = partial(owt_collate_fn, bos_token_id=bos_id)
+    return DataLoader(ds, batch_size=batch_size, collate_fn=fn,
+                      num_workers=num_workers, pin_memory=True, drop_last=True)
