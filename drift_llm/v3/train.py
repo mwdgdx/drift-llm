@@ -231,6 +231,7 @@ def train(args):
     if is_main():
         logger.info(f"Features: {'multiscale (4-layer)' if use_multiscale else 'last-layer mean'}  "
                      f"R_list={R_list}  C={args.cluster_batch} G={args.G} P={args.P} N={args.N}")
+        logger.info(f"Soft-vocab τ={args.temperature}  λ_div={args.lambda_diversity}")
         logger.info(f"Training for {args.max_steps} steps …")
 
     # ======================== Main loop ========================
@@ -246,9 +247,14 @@ def train(args):
         # 1. Sample clusters
         sampled = np.random.choice(valid_clusters, size=C, replace=False)
 
-        # 2. Generate C*G embeddings
+        # 2. Generate C*G hidden states → soft-vocabulary → embeddings
         noise = torch.randn(C * G, args.seq_len, args.d_model, device=device)
-        gen_emb = generator(noise)                   # [C*G, L, 768]  (has grad)
+        gen_h = generator(noise)                     # [C*G, L, d_model]  (has grad)
+
+        # Soft vocabulary projection: keeps output on embedding manifold
+        logits = gen_h @ vocab_emb.T                 # [C*G, L, V]
+        soft_probs = F.softmax(logits / args.temperature, dim=-1)
+        gen_emb = soft_probs @ vocab_emb             # [C*G, L, 768]
 
         # 3. Features through frozen GPT-2 (differentiable)
         gen_feat = feat_fn(gpt2, gen_emb)            # [C*G, D_feat]  (has grad)
@@ -264,9 +270,14 @@ def train(args):
 
         # 5. Drift loss
         loss, info = drift_loss(gen=gen_feat, fixed_pos=pos, fixed_neg=neg, R_list=R_list)
-        total_loss = loss.mean()
+        drift_val = loss.mean()
 
-        # 6. Backward + step
+        # 6. Diversity loss: penalize collapse within each cluster
+        feat_std = gen_feat.std(dim=1).mean()
+        div_loss = -feat_std
+        total_loss = drift_val + args.lambda_diversity * div_loss
+
+        # 7. Backward + step
         optimizer.zero_grad()
         total_loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
@@ -276,13 +287,21 @@ def train(args):
         if step % args.log_every == 0 and is_main():
             scale = info.get("scale", torch.tensor(0.0))
             scale_val = scale.item() if isinstance(scale, torch.Tensor) else scale
+            # softmax entropy (how peaked the token distribution is)
+            with torch.no_grad():
+                ent = -(soft_probs * soft_probs.clamp(min=1e-8).log()).sum(-1).mean()
             logger.info(
                 f"step={step:>6}/{args.max_steps}  loss={total_loss.item():.4f}  "
-                f"scale={scale_val:.4f}  gnorm={grad_norm:.3f}  lr={lr:.2e}"
+                f"drift={drift_val.item():.4f}  div={div_loss.item():.4f}  "
+                f"scale={scale_val:.4f}  sm_ent={ent.item():.2f}  "
+                f"gnorm={grad_norm:.3f}  lr={lr:.2e}"
             )
             if args.wandb_project:
                 import wandb
-                m = {"loss": total_loss.item(), "lr": lr, "grad_norm": grad_norm, "step": step}
+                m = {"loss": total_loss.item(), "drift_loss": drift_val.item(),
+                     "diversity_loss": div_loss.item(), "feat_std": feat_std.item(),
+                     "softmax_entropy": ent.item(),
+                     "lr": lr, "grad_norm": grad_norm, "step": step}
                 for k, v in info.items():
                     m[f"drift/{k}"] = v.item() if isinstance(v, torch.Tensor) else v
                 wandb.log(m)
@@ -314,9 +333,13 @@ def _evaluate(gen, gpt2, vocab_emb, all_feats, token_ids, tok, args, step, devic
 
     n_samples = 16
     noise = torch.randn(n_samples, args.seq_len, args.d_model, device=device)
-    emb = gen(noise)                                 # [n, L, 768]
-    tokens = gen.decode_to_tokens(emb, vocab_emb)    # [n, L]
-    feats = feat_fn(gpt2, emb)                       # [n, D]
+    gen_h = gen(noise)                               # [n, L, d_model]
+
+    # Soft-vocab decode
+    logits = gen_h @ vocab_emb.T                     # [n, L, V]
+    tokens = logits.argmax(dim=-1)                   # [n, L]
+    soft_emb = F.softmax(logits / args.temperature, dim=-1) @ vocab_emb
+    feats = feat_fn(gpt2, soft_emb)                  # [n, D]
 
     logger.info("─── Generated samples ───")
     table_rows = []
@@ -378,6 +401,10 @@ if __name__ == "__main__":
     p.add_argument("--R_list", type=float, nargs="+", default=[0.02, 0.05, 0.2])
     p.add_argument("--multiscale", action="store_true",
                    help="Use multi-layer GPT-2 features (4×768=3072-dim)")
+    p.add_argument("--temperature", type=float, default=5.0,
+                   help="Softmax temperature for soft-vocab projection (higher=softer)")
+    p.add_argument("--lambda_diversity", type=float, default=0.1,
+                   help="Weight of diversity regularization loss")
 
     # optim
     p.add_argument("--lr", type=float, default=3e-4)
