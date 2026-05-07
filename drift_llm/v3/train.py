@@ -201,7 +201,7 @@ def train(args):
         n_heads=args.n_heads, seq_len=args.seq_len, dropout=args.dropout,
     ).to(device)
     if ddp:
-        generator = DDP(generator, device_ids=[local_rank])
+        generator = DDP(generator, device_ids=[local_rank], find_unused_parameters=True)
     raw_gen = generator.module if ddp else generator
 
     need_gpt2 = args.feature_mode in ("gpt2_quantized", "gpt2_soft", "gpt2_direct")
