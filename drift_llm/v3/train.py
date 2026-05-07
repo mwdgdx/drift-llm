@@ -281,9 +281,11 @@ def train(args):
 
         # 2. Generate C*G hidden states → soft-vocabulary → embeddings
         noise = torch.randn(C * G, args.seq_len, args.d_model, device=device)
-        gen_h = generator(noise)                     # [C*G, L, d_model]  (has grad)
+        gen_h_raw = generator(noise)                  # [C*G, L, d_model]  (has grad)
         if args.pos_noise > 0:
-            gen_h = gen_h + args.pos_noise * torch.randn_like(gen_h)
+            gen_h = gen_h_raw + args.pos_noise * torch.randn_like(gen_h_raw)
+        else:
+            gen_h = gen_h_raw
 
         # 3. Features + vocab proximity reg
         gen_norm = F.normalize(gen_h.reshape(-1, gen_h.shape[-1]), dim=-1)
@@ -330,8 +332,9 @@ def train(args):
         feat_std = gen_feat.std(dim=1).mean()
         div_loss = -feat_std
 
-        # 7. Intra-sequence diversity: log-variance has strong gradients near collapse
-        pos_var = gen_h.var(dim=1).mean().clamp(min=1e-8)
+        # 7. Intra-sequence diversity: use pre-noise gen_h so external noise
+        #    doesn't mask the generator's actual diversity
+        pos_var = gen_h_raw.var(dim=1).mean().clamp(min=1e-8)
         intra_loss = -torch.log(pos_var)
 
         # Curriculum: ramp drift loss in after drift_warmup steps
