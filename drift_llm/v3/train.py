@@ -143,12 +143,16 @@ def emb_stats_features(embeddings, n_chunks=8):
     return torch.cat(parts, dim=-1)
 
 
-def gpt2_soft_features(gpt2, logits, vocab_emb, temperature):
+def gpt2_soft_features(gpt2, logits, vocab_emb, temperature, top_k=0):
     """Soft embeddings → frozen GPT-2 → mean pool.
 
-    At moderate τ (2-5), soft_emb is peaked enough for GPT-2 to produce
-    meaningful features while retaining gradient flow through softmax.
+    top_k > 0: mask all but the top-k logits before softmax.
+    This keeps entropy low (≤ ln(k)) so GPT-2 sees meaningful inputs.
     """
+    if top_k > 0:
+        topk_vals, _ = logits.topk(top_k, dim=-1)
+        threshold = topk_vals[..., -1:]
+        logits = logits.masked_fill(logits < threshold, -1e9)
     soft_emb = F.softmax(logits / temperature, dim=-1) @ vocab_emb
     h = gpt2(inputs_embeds=soft_emb).last_hidden_state
     return h.mean(dim=1)
@@ -282,7 +286,7 @@ def train(args):
 
         # 3. Features
         if use_gpt2:
-            gen_feat = gpt2_soft_features(gpt2, logits, vocab_emb, args.temperature)
+            gen_feat = gpt2_soft_features(gpt2, logits, vocab_emb, args.temperature, args.top_k)
         else:
             soft_probs = F.softmax(logits / args.temperature, dim=-1)
             gen_emb = soft_probs @ vocab_emb
@@ -435,6 +439,8 @@ if __name__ == "__main__":
                    help="Feature extraction: gpt2_soft (soft emb → GPT-2) or emb_stats (embedding statistics)")
     p.add_argument("--temperature", type=float, default=3.0,
                    help="Softmax temperature for soft-vocab projection (higher=softer)")
+    p.add_argument("--top_k", type=int, default=0,
+                   help="Top-k logit filtering before softmax (0=disabled, 64 recommended for gpt2_soft)")
     p.add_argument("--lambda_diversity", type=float, default=1.0,
                    help="Weight of diversity regularization loss")
 
