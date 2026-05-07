@@ -302,7 +302,7 @@ def train(args):
         G = args.G
 
         drift_w = min(1.0, max(0.0, (step - args.drift_warmup) / max(args.drift_warmup, 1)))
-        body_scale = 1.0
+        body_scale = max(0.1, drift_w)
 
         # 1. Sample clusters
         sampled = np.random.choice(valid_clusters, size=C, replace=False)
