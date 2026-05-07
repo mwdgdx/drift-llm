@@ -31,10 +31,11 @@ CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun \
     --N 16 \
     --cluster_batch 8 \
     --R_list 0.02 0.05 0.2 \
-    --feature_mode gpt2_quantized \
+    --feature_mode gpt2_direct \
     --lambda_diversity 5.0 \
-    --lambda_reg 5.0 \
+    --lambda_reg 10.0 \
     --lambda_intra 0.5 \
+    --drift_warmup 3000 \
     --grad_clip 5.0 \
     --lr 1e-4 \
     --warmup_steps 1000 \

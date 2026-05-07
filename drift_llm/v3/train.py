@@ -332,7 +332,9 @@ def train(args):
         pos_var = gen_h.var(dim=1).mean().clamp(min=1e-8)
         intra_loss = -torch.log(pos_var)
 
-        total_loss = (drift_val + args.lambda_diversity * div_loss
+        # Curriculum: ramp drift loss in after drift_warmup steps
+        drift_w = min(1.0, max(0.0, (step - args.drift_warmup) / max(args.drift_warmup, 1)))
+        total_loss = (drift_w * (drift_val + args.lambda_diversity * div_loss)
                       + args.lambda_reg * reg_loss + args.lambda_intra * intra_loss)
 
         # 7. Backward + step
@@ -355,7 +357,7 @@ def train(args):
                 f"step={step:>6}/{args.max_steps}  loss={total_loss.item():.4f}  "
                 f"drift={drift_val.item():.4f}  div={div_loss.item():.4f}  "
                 f"reg={reg_loss.item():.4f}  intra={intra_loss.item():.4f}  "
-                f"pvar={pos_var.item():.4f}  {extra}  "
+                f"pvar={pos_var.item():.4f}  dw={drift_w:.2f}  {extra}  "
                 f"gnorm={grad_norm:.3f}  lr={lr:.2e}"
             )
             if args.wandb_project:
@@ -487,6 +489,8 @@ if __name__ == "__main__":
     p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--max_steps", type=int, default=50000)
     p.add_argument("--grad_clip", type=float, default=5.0)
+    p.add_argument("--drift_warmup", type=int, default=3000,
+                   help="Steps before drift loss fully activates (curriculum)")
 
     # logging / saving
     p.add_argument("--log_every", type=int, default=50)
