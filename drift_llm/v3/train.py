@@ -358,11 +358,19 @@ def train(args):
                     sp = F.softmax(logits / args.temperature, dim=-1)
                     ent_val = -(sp * sp.clamp(min=1e-8).log()).sum(-1).mean().item()
                 extra = f"sm_ent={ent_val:.2f}"
+            with torch.no_grad():
+                raw_norm = F.normalize(gen_h_raw.reshape(-1, gen_h_raw.shape[-1]), dim=-1)
+                raw_nearest = (raw_norm @ vocab_norm.T).argmax(dim=-1)
+                raw_nearest = raw_nearest.view(C * G, args.seq_len)
+                uniq_per_seq = torch.tensor([t.unique().numel() for t in raw_nearest], dtype=torch.float)
+                mean_uniq = uniq_per_seq.mean().item()
+                raw_max_cos = (raw_norm @ vocab_norm.T).max(dim=-1).values.mean().item()
             logger.info(
                 f"step={step:>6}/{args.max_steps}  loss={total_loss.item():.4f}  "
                 f"drift={drift_val.item():.4f}  div={div_loss.item():.4f}  "
                 f"reg={reg_loss.item():.4f}  intra={intra_loss.item():.4f}  "
                 f"pvar={pos_var.item():.4f}  dw={drift_w:.2f}  {extra}  "
+                f"raw_cos={raw_max_cos:.3f}  uniq={mean_uniq:.1f}/{args.seq_len}  "
                 f"gnorm={grad_norm:.3f}  lr={lr:.2e}"
             )
             if args.wandb_project:
@@ -373,6 +381,8 @@ def train(args):
                      "pos_variance": pos_var.item(),
                      "lr": lr, "grad_norm": grad_norm, "step": step}
                 m["mean_max_cosine"] = -reg_loss.item()
+                m["raw_max_cosine"] = raw_max_cos
+                m["unique_tokens_per_seq"] = mean_uniq
                 if args.feature_mode in ("gpt2_soft", "emb_stats"):
                     m["softmax_entropy"] = ent_val
                 for k, v in info.items():

@@ -36,7 +36,7 @@ CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun \
     --lambda_reg 10.0 \
     --lambda_intra 0.5 \
     --drift_warmup 3000 \
-    --pos_noise 0.5 \
+    --pos_noise 0.2 \
     --grad_clip 5.0 \
     --lr 1e-4 \
     --warmup_steps 1000 \
