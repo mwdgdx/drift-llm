@@ -362,13 +362,16 @@ def train(args):
         feat_std = gen_feat.std(dim=1).mean()
         div_loss = -feat_std
 
-        # 7. Intra-sequence diversity: use pre-noise gen_h so external noise
-        #    doesn't mask the generator's actual diversity
+        # 7. Intra-sequence diversity: cosine-based — penalize positions
+        #    having similar directions (direction determines decoded token)
+        gen_h_dir = F.normalize(gen_h_raw, dim=-1)             # [C*G, L, 768]
+        cos_mat = torch.bmm(gen_h_dir, gen_h_dir.transpose(1, 2))  # [C*G, L, L]
+        intra_mask = ~torch.eye(args.seq_len, dtype=torch.bool, device=device)
+        intra_cos = cos_mat[:, intra_mask].mean()
+        intra_loss = intra_cos
         pos_var = gen_h_raw.var(dim=1).mean().clamp(min=1e-8)
-        intra_loss = -torch.log(pos_var)
 
         # 8. Target direction loss: push position i toward target token i
-        gen_h_dir = F.normalize(gen_h_raw, dim=-1)             # [C*G, L, 768]
         target_cos = (gen_h_dir * target_embs.unsqueeze(0)).sum(dim=-1)  # [C*G, L]
         target_loss = -target_cos.mean()
 
@@ -412,7 +415,7 @@ def train(args):
                 f"step={step:>6}/{args.max_steps}  loss={total_loss.item():.4f}  "
                 f"drift={drift_val.item():.4f}  div={div_loss.item():.4f}  "
                 f"reg={reg_loss.item():.4f}  "
-                f"pvar={pos_var.item():.4f}  dw={drift_w:.2f}  {extra}  "
+                f"icos={intra_cos.item():.3f}  pvar={pos_var.item():.4f}  dw={drift_w:.2f}  {extra}  "
                 f"raw_cos={raw_max_cos:.3f}  uniq={mean_uniq:.1f}/{args.seq_len}  "
                 f"iuniq={inter_uniq}  gnorm={grad_norm:.3f}  lr={lr:.2e}"
             )
@@ -421,7 +424,8 @@ def train(args):
                 m = {"loss": total_loss.item(), "drift_loss": drift_val.item(),
                      "diversity_loss": div_loss.item(), "feat_std": feat_std.item(),
                      "reg_loss": reg_loss.item(), "target_loss": target_loss.item(),
-                     "intra_loss": intra_loss.item(), "pos_variance": pos_var.item(),
+                     "intra_loss": intra_loss.item(), "intra_cos": intra_cos.item(),
+                     "pos_variance": pos_var.item(),
                      "lr": lr, "grad_norm": grad_norm, "step": step}
                 m["mean_max_cosine"] = -reg_loss.item()
                 m["raw_max_cosine"] = raw_max_cos
@@ -436,7 +440,7 @@ def train(args):
         # ---- Eval ----
         if (step % args.eval_every == 0 or step == args.max_steps) and is_main():
             _evaluate(raw_gen, gpt2, vocab_emb, all_features_gpu, token_ids, tok,
-                      args, step, device, offset_bank)
+                      args, step, device, offset_bank, body_scale)
 
         # ---- Save ----
         if (step % args.save_every == 0 or step == args.max_steps) and is_main():
@@ -454,12 +458,12 @@ def train(args):
 
 @torch.no_grad()
 def _evaluate(gen, gpt2, vocab_emb, all_feats, token_ids, tok, args, step, device,
-              offset_bank=None):
+              offset_bank=None, body_scale=1.0):
     gen.eval()
 
     n_samples = 16
     noise = torch.randn(n_samples, args.seq_len, args.d_model, device=device)
-    gen_h = gen(noise)                               # [n, L, d_model]
+    gen_h = gen(noise, body_scale=body_scale)        # [n, L, d_model]
     if offset_bank is not None:
         offset_idx = (noise[:, 0, 0] * 1000).long().abs() % offset_bank.shape[0]
         gen_h = gen_h + offset_bank[offset_idx]
