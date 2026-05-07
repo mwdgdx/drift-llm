@@ -228,7 +228,7 @@ def train(args):
             target_ids.append(min_sim.argmin().item())
         target_ids = torch.tensor(target_ids, device=device)
         target_embs = F.normalize(vocab_emb[target_ids], dim=-1)
-        raw_gen.pos_offset.copy_(2.0 * vocab_emb[target_ids])
+        raw_gen.pos_offset.copy_(0.5 * vocab_emb[target_ids])
     if ddp:
         dist.broadcast(target_embs, src=0)
         dist.broadcast(raw_gen.pos_offset.data, src=0)
@@ -295,7 +295,7 @@ def train(args):
         G = args.G
 
         drift_w = min(1.0, max(0.0, (step - args.drift_warmup) / max(args.drift_warmup, 1)))
-        body_scale = max(0.1, drift_w)
+        body_scale = 1.0
 
         # 1. Sample clusters
         sampled = np.random.choice(valid_clusters, size=C, replace=False)
