@@ -224,6 +224,7 @@ def train(args):
             cur = vn[target_ids]
             sims = cur @ vn.T
             min_sim = sims.min(dim=0).values
+            min_sim[target_ids] = float('inf')
             target_ids.append(min_sim.argmin().item())
         target_ids = torch.tensor(target_ids, device=device)
         target_embs = F.normalize(vocab_emb[target_ids], dim=-1)
