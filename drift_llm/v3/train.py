@@ -262,7 +262,7 @@ def train(args):
     if is_main():
         logger.info(f"Features: {args.feature_mode}  "
                      f"R_list={R_list}  C={args.cluster_batch} G={args.G} P={args.P} N={args.N}")
-        logger.info(f"τ={args.temperature}  λ_div={args.lambda_diversity}  λ_reg={args.lambda_reg}")
+        logger.info(f"τ={args.temperature}  λ_div={args.lambda_diversity}  λ_reg={args.lambda_reg}  λ_intra={args.lambda_intra}")
         logger.info(f"Training for {args.max_steps} steps …")
 
     # ======================== Main loop ========================
@@ -318,7 +318,13 @@ def train(args):
         # 6. Diversity loss: penalize collapse within each cluster
         feat_std = gen_feat.std(dim=1).mean()
         div_loss = -feat_std
-        total_loss = drift_val + args.lambda_diversity * div_loss + args.lambda_reg * reg_loss
+
+        # 7. Intra-sequence diversity: penalize repeated tokens at every position
+        pos_var = gen_h.var(dim=1).mean()  # variance across positions within each sequence
+        intra_loss = -pos_var
+
+        total_loss = (drift_val + args.lambda_diversity * div_loss
+                      + args.lambda_reg * reg_loss + args.lambda_intra * intra_loss)
 
         # 7. Backward + step
         optimizer.zero_grad()
@@ -340,14 +346,16 @@ def train(args):
             logger.info(
                 f"step={step:>6}/{args.max_steps}  loss={total_loss.item():.4f}  "
                 f"drift={drift_val.item():.4f}  div={div_loss.item():.4f}  "
-                f"reg={reg_loss.item():.4f}  scale={scale_val:.4f}  {extra}  "
+                f"reg={reg_loss.item():.4f}  intra={intra_loss.item():.4f}  "
+                f"pvar={pos_var.item():.4f}  {extra}  "
                 f"gnorm={grad_norm:.3f}  lr={lr:.2e}"
             )
             if args.wandb_project:
                 import wandb
                 m = {"loss": total_loss.item(), "drift_loss": drift_val.item(),
                      "diversity_loss": div_loss.item(), "feat_std": feat_std.item(),
-                     "reg_loss": reg_loss.item(),
+                     "reg_loss": reg_loss.item(), "intra_loss": intra_loss.item(),
+                     "pos_variance": pos_var.item(),
                      "lr": lr, "grad_norm": grad_norm, "step": step}
                 if args.feature_mode == "direct":
                     m["mean_max_cosine"] = -reg_loss.item()
@@ -466,6 +474,8 @@ if __name__ == "__main__":
                    help="Weight of diversity regularization loss")
     p.add_argument("--lambda_reg", type=float, default=0.1,
                    help="Weight of vocab proximity regularization (direct mode only)")
+    p.add_argument("--lambda_intra", type=float, default=1.0,
+                   help="Weight of intra-sequence diversity (penalizes repeated tokens)")
 
     # optim
     p.add_argument("--lr", type=float, default=3e-4)

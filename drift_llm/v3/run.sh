@@ -34,6 +34,7 @@ CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun \
     --feature_mode direct \
     --lambda_diversity 5.0 \
     --lambda_reg 1.0 \
+    --lambda_intra 2.0 \
     --lr 1e-4 \
     --warmup_steps 1000 \
     --max_steps 50000 \
