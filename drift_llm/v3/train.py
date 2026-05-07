@@ -222,7 +222,7 @@ def train(args):
         rng_np = np.random.RandomState(42)
         offset_indices = rng_np.choice(len(token_ids), K_offsets, replace=False)
         offset_tokens = token_ids[offset_indices].to(device)
-        offset_bank = 2.0 * vocab_emb[offset_tokens]
+        offset_bank = vocab_emb[offset_tokens]
         raw_gen.pos_offset.data.zero_()
         raw_gen.pos_offset.requires_grad_(False)
         target_embs = F.normalize(offset_bank[0], dim=-1)
@@ -278,7 +278,7 @@ def train(args):
     if is_main():
         logger.info(f"Features: {args.feature_mode}  "
                      f"R_list={R_list}  C={args.cluster_batch} G={args.G} P={args.P} N={args.N}")
-        logger.info(f"τ={args.temperature}  λ_div={args.lambda_diversity}  λ_reg={args.lambda_reg}  λ_intra={args.lambda_intra}  λ_tgt={args.lambda_target}  max_bs={args.max_body_scale}")
+        logger.info(f"τ={args.temperature}  λ_div={args.lambda_diversity}  λ_reg={args.lambda_reg}  λ_intra={args.lambda_intra}  λ_tgt={args.lambda_target}  max_bs={args.max_body_scale}  ofs={args.offset_scale}  ofs_decay={args.offset_decay_steps}")
         logger.info(f"Training for {args.max_steps} steps …")
 
     # ======================== Main loop ========================
@@ -298,10 +298,14 @@ def train(args):
         sampled = np.random.choice(valid_clusters, size=C, replace=False)
 
         # 2. Generate C*G hidden states → per-sample pos_offset → embeddings
+        if args.offset_decay_steps > 0:
+            ofs = args.offset_scale * max(0.2, 1.0 - step / args.offset_decay_steps)
+        else:
+            ofs = args.offset_scale
         noise = torch.randn(C * G, args.seq_len, args.d_model, device=device)
         gen_h_raw = generator(noise, body_scale=body_scale)  # [C*G, L, d_model]
         offset_idx = (noise[:, 0, 0] * 1000).long().abs() % K_offsets
-        gen_h_raw = gen_h_raw + offset_bank[offset_idx]     # per-sample offset
+        gen_h_raw = gen_h_raw + ofs * offset_bank[offset_idx]
         if args.pos_noise > 0:
             gen_h = gen_h_raw + args.pos_noise * torch.randn_like(gen_h_raw)
         else:
@@ -409,7 +413,7 @@ def train(args):
                 f"reg={reg_loss.item():.4f}  "
                 f"icos={intra_cos.item():.3f}  pvar={pos_var.item():.4f}  dw={drift_w:.2f}  {extra}  "
                 f"raw_cos={raw_max_cos:.3f}  uniq={mean_uniq:.1f}/{args.seq_len}  "
-                f"iuniq={inter_uniq}  gnorm={grad_norm:.3f}  lr={lr:.2e}"
+                f"iuniq={inter_uniq}  gnorm={grad_norm:.3f}  lr={lr:.2e}  ofs={ofs:.2f}"
             )
             if args.wandb_project:
                 import wandb
@@ -432,7 +436,7 @@ def train(args):
         # ---- Eval ----
         if (step % args.eval_every == 0 or step == args.max_steps) and is_main():
             _evaluate(raw_gen, gpt2, vocab_emb, all_features_gpu, token_ids, tok,
-                      args, step, device, offset_bank, body_scale)
+                      args, step, device, offset_bank, body_scale, ofs)
 
         # ---- Save ----
         if (step % args.save_every == 0 or step == args.max_steps) and is_main():
@@ -450,7 +454,7 @@ def train(args):
 
 @torch.no_grad()
 def _evaluate(gen, gpt2, vocab_emb, all_feats, token_ids, tok, args, step, device,
-              offset_bank=None, body_scale=1.0):
+              offset_bank=None, body_scale=1.0, offset_scale=2.0):
     gen.eval()
 
     n_samples = 16
@@ -458,7 +462,7 @@ def _evaluate(gen, gpt2, vocab_emb, all_feats, token_ids, tok, args, step, devic
     gen_h = gen(noise, body_scale=body_scale)        # [n, L, d_model]
     if offset_bank is not None:
         offset_idx = (noise[:, 0, 0] * 1000).long().abs() % offset_bank.shape[0]
-        gen_h = gen_h + offset_bank[offset_idx]
+        gen_h = gen_h + offset_scale * offset_bank[offset_idx]
 
     tokens = gen.decode_to_tokens(gen_h, vocab_emb)
     if args.feature_mode in ("gpt2_quantized", "gpt2_direct", "gpt2_soft") and gpt2 is not None:
@@ -562,6 +566,10 @@ if __name__ == "__main__":
                    help="Cap body_scale to keep offsets dominant (0.25 prevents token collapse)")
     p.add_argument("--pos_noise", type=float, default=0.0,
                    help="Per-position noise added to generator output (breaks position collapse)")
+    p.add_argument("--offset_scale", type=float, default=2.0,
+                   help="Initial scale for offset bank embeddings")
+    p.add_argument("--offset_decay_steps", type=int, default=0,
+                   help="Steps to decay offset_scale to 20%% of initial (0=no decay)")
 
     # logging / saving
     p.add_argument("--log_every", type=int, default=50)
