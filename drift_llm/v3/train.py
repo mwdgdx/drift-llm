@@ -3,7 +3,7 @@ v3 Text Drifting: unconditional text generation via embedding-space drift loss.
 
 Design:
 - Generator outputs continuous embeddings in GPT-2's word-embedding space
-- Frozen GPT-2 extracts semantic features from these embeddings (differentiable)
+- Embedding statistics (mean, std, chunk means) as differentiable features
 - K-means on GPT-2 features provides pseudo-class clusters for memory bank
 - Pure drift loss (no CE) with per-cluster positive/negative sampling
 - Decode to text via nearest-neighbor cosine similarity to vocab embeddings
@@ -13,7 +13,7 @@ Usage:
     python train.py --mode preprocess
 
     # 2. Train (multi-GPU DDP)
-    CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun --nproc_per_node=6 train.py --mode train --wandb_project drift-llm-v3
+    CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun --nproc_per_node=6 train.py --mode train
 """
 
 import argparse
@@ -124,28 +124,23 @@ def preprocess(args):
 
 # ======================== Feature helpers ========================
 
-def gpt2_features(gpt2, embeddings):
-    """Differentiable feature extraction: continuous embs → GPT-2 → mean-pool.
+def emb_stats_features(embeddings, n_chunks=4):
+    """Embedding statistics features: mean + std + chunk means.
+
+    No model forward needed — just statistics of the embedding sequence.
+    Differentiable w.r.t. embeddings for gradient flow to generator.
 
     Args:
-        gpt2: frozen GPT2Model
-        embeddings: [B, L, 768] continuous (has grad from generator)
+        embeddings: [B, L, D]
+        n_chunks: number of sequential chunks for positional features
     Returns:
-        [B, 768] feature vectors (has grad)
+        [B, (2 + n_chunks) * D] feature vector
     """
-    h = gpt2(inputs_embeds=embeddings).last_hidden_state  # [B, L, 768]
-    return h.mean(dim=1)
-
-
-def gpt2_multiscale_features(gpt2, embeddings):
-    """Multi-layer features: layers 3, 6, 9, 12 → concat mean-pools → [B, 3072].
-
-    Provides richer signal than a single layer (analogous to MAE multi-scale in image drifting).
-    """
-    out = gpt2(inputs_embeds=embeddings, output_hidden_states=True)
-    parts = []
-    for idx in [3, 6, 9, 12]:
-        parts.append(out.hidden_states[idx].mean(dim=1))
+    parts = [embeddings.mean(dim=1), embeddings.std(dim=1)]
+    L = embeddings.shape[1]
+    chunk_size = L // n_chunks
+    for i in range(n_chunks):
+        parts.append(embeddings[:, i * chunk_size : (i + 1) * chunk_size].mean(dim=1))
     return torch.cat(parts, dim=-1)
 
 
@@ -172,11 +167,9 @@ def train(args):
             dist.barrier()
 
     data = torch.load(data_path, map_location="cpu", weights_only=False)
-    all_features = data["features"]                # [N, D_feat]
     cluster_ids = data["cluster_ids"]              # [N]
     token_ids = data["token_ids"]                  # [N, L]
     num_clusters = int(data["num_clusters"])
-    D_feat = all_features.shape[1]
 
     # per-cluster index lists
     cluster_idx = {}
@@ -185,11 +178,6 @@ def train(args):
         if len(idx) > 0:
             cluster_idx[c] = idx
     valid_clusters = np.array(sorted(cluster_idx.keys()))
-
-    all_features_gpu = all_features.to(device)
-    if is_main():
-        logger.info(f"Data: {all_features.shape[0]} samples, {len(valid_clusters)} non-empty clusters, "
-                     f"feat_dim={D_feat}")
 
     # ---- Models ----
     generator = EmbeddingGenerator(
@@ -200,14 +188,30 @@ def train(args):
         generator = DDP(generator, device_ids=[local_rank])
     raw_gen = generator.module if ddp else generator
 
-    gpt2 = GPT2Model.from_pretrained("gpt2").to(device).eval()
-    for p in gpt2.parameters():
-        p.requires_grad = False
-    vocab_emb = gpt2.wte.weight.detach()           # [V, 768]
+    _gpt2 = GPT2Model.from_pretrained("gpt2")
+    vocab_emb = _gpt2.wte.weight.detach().clone().to(device)  # [V, 768]
+    del _gpt2
 
     n_params = sum(p.numel() for p in raw_gen.parameters()) / 1e6
     if is_main():
-        logger.info(f"Generator: {n_params:.1f}M params  |  GPT-2 frozen for features")
+        logger.info(f"Generator: {n_params:.1f}M params  |  Embedding stats features")
+
+    # ---- Precompute memory bank features using embedding statistics ----
+    if is_main():
+        logger.info("Computing embedding stats features for memory bank …")
+    emb_bank_bs = 1024
+    all_feat_parts = []
+    for i in range(0, len(token_ids), emb_bank_bs):
+        ids_batch = token_ids[i : i + emb_bank_bs].to(device)
+        emb_batch = vocab_emb[ids_batch]            # [bs, L, 768]
+        feat_batch = emb_stats_features(emb_batch)  # [bs, D_feat]
+        all_feat_parts.append(feat_batch.cpu())
+    all_features = torch.cat(all_feat_parts)         # [N, D_feat]
+    all_features_gpu = all_features.to(device)
+    D_feat = all_features.shape[1]
+    if is_main():
+        logger.info(f"Data: {all_features.shape[0]} samples, {len(valid_clusters)} non-empty clusters, "
+                     f"feat_dim={D_feat}")
 
     # ---- Optim / schedule ----
     optimizer = torch.optim.AdamW(generator.parameters(), lr=args.lr, weight_decay=0.01)
@@ -226,10 +230,8 @@ def train(args):
     tok = AutoTokenizer.from_pretrained("gpt2")
     tok.pad_token = tok.eos_token
 
-    use_multiscale = args.multiscale
-    feat_fn = gpt2_multiscale_features if use_multiscale else gpt2_features
     if is_main():
-        logger.info(f"Features: {'multiscale (4-layer)' if use_multiscale else 'last-layer mean'}  "
+        logger.info(f"Features: emb_stats (mean+std+{4} chunks)  "
                      f"R_list={R_list}  C={args.cluster_batch} G={args.G} P={args.P} N={args.N}")
         logger.info(f"Soft-vocab τ={args.temperature}  λ_div={args.lambda_diversity}")
         logger.info(f"Training for {args.max_steps} steps …")
@@ -256,8 +258,8 @@ def train(args):
         soft_probs = F.softmax(logits / args.temperature, dim=-1)
         gen_emb = soft_probs @ vocab_emb             # [C*G, L, 768]
 
-        # 3. Features through frozen GPT-2 (differentiable)
-        gen_feat = feat_fn(gpt2, gen_emb)            # [C*G, D_feat]  (has grad)
+        # 3. Embedding statistics features (differentiable, no model forward)
+        gen_feat = emb_stats_features(gen_emb)       # [C*G, D_feat]  (has grad)
         gen_feat = gen_feat.view(C, G, -1)           # [C, G, D_feat]
 
         # 4. Positive / negative from pre-computed bank
@@ -308,8 +310,8 @@ def train(args):
 
         # ---- Eval ----
         if (step % args.eval_every == 0 or step == args.max_steps) and is_main():
-            _evaluate(raw_gen, gpt2, vocab_emb, all_features_gpu, token_ids, tok,
-                      args, step, device, use_multiscale)
+            _evaluate(raw_gen, vocab_emb, all_features_gpu, token_ids, tok,
+                      args, step, device)
 
         # ---- Save ----
         if (step % args.save_every == 0 or step == args.max_steps) and is_main():
@@ -326,10 +328,8 @@ def train(args):
 # ======================== Evaluation ========================
 
 @torch.no_grad()
-def _evaluate(gen, gpt2, vocab_emb, all_feats, token_ids, tok, args, step, device,
-              use_multiscale):
+def _evaluate(gen, vocab_emb, all_feats, token_ids, tok, args, step, device):
     gen.eval()
-    feat_fn = gpt2_multiscale_features if use_multiscale else gpt2_features
 
     n_samples = 16
     noise = torch.randn(n_samples, args.seq_len, args.d_model, device=device)
@@ -339,7 +339,7 @@ def _evaluate(gen, gpt2, vocab_emb, all_feats, token_ids, tok, args, step, devic
     logits = gen_h @ vocab_emb.T                     # [n, L, V]
     tokens = logits.argmax(dim=-1)                   # [n, L]
     soft_emb = F.softmax(logits / args.temperature, dim=-1) @ vocab_emb
-    feats = feat_fn(gpt2, soft_emb)                  # [n, D]
+    feats = emb_stats_features(soft_emb)             # [n, D_feat]
 
     logger.info("─── Generated samples ───")
     table_rows = []
@@ -399,11 +399,9 @@ if __name__ == "__main__":
     p.add_argument("--N", type=int, default=16, help="negative samples per cluster")
     p.add_argument("--cluster_batch", type=int, default=8, help="clusters per step")
     p.add_argument("--R_list", type=float, nargs="+", default=[0.02, 0.05, 0.2])
-    p.add_argument("--multiscale", action="store_true",
-                   help="Use multi-layer GPT-2 features (4×768=3072-dim)")
-    p.add_argument("--temperature", type=float, default=5.0,
+    p.add_argument("--temperature", type=float, default=1.0,
                    help="Softmax temperature for soft-vocab projection (higher=softer)")
-    p.add_argument("--lambda_diversity", type=float, default=0.1,
+    p.add_argument("--lambda_diversity", type=float, default=1.0,
                    help="Weight of diversity regularization loss")
 
     # optim
