@@ -124,23 +124,28 @@ def preprocess(args):
 
 # ======================== Feature helpers ========================
 
-def emb_stats_features(embeddings, n_chunks=4):
-    """Embedding statistics features: mean + std + chunk means.
+def emb_stats_features(embeddings, n_chunks=8):
+    """Embedding statistics features: mean + std + chunk means + bigram transitions.
 
-    No model forward needed — just statistics of the embedding sequence.
-    Differentiable w.r.t. embeddings for gradient flow to generator.
+    Captures both bag-of-words statistics AND local sequential structure
+    via element-wise products of consecutive embeddings.
 
     Args:
         embeddings: [B, L, D]
         n_chunks: number of sequential chunks for positional features
     Returns:
-        [B, (2 + n_chunks) * D] feature vector
+        [B, (3 + n_chunks) * D] feature vector
     """
     parts = [embeddings.mean(dim=1), embeddings.std(dim=1)]
     L = embeddings.shape[1]
-    chunk_size = L // n_chunks
+    chunk_size = max(1, L // n_chunks)
     for i in range(n_chunks):
-        parts.append(embeddings[:, i * chunk_size : (i + 1) * chunk_size].mean(dim=1))
+        start = i * chunk_size
+        end = min((i + 1) * chunk_size, L)
+        parts.append(embeddings[:, start:end].mean(dim=1))
+    if L > 1:
+        bigram = embeddings[:, :-1] * embeddings[:, 1:]
+        parts.append(bigram.mean(dim=1))
     return torch.cat(parts, dim=-1)
 
 
@@ -231,7 +236,7 @@ def train(args):
     tok.pad_token = tok.eos_token
 
     if is_main():
-        logger.info(f"Features: emb_stats (mean+std+{4} chunks)  "
+        logger.info(f"Features: emb_stats (mean+std+8chunks+bigram)  "
                      f"R_list={R_list}  C={args.cluster_batch} G={args.G} P={args.P} N={args.N}")
         logger.info(f"Soft-vocab τ={args.temperature}  λ_div={args.lambda_diversity}")
         logger.info(f"Training for {args.max_steps} steps …")
