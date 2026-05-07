@@ -288,7 +288,7 @@ def train(args):
     if is_main():
         logger.info(f"Features: {args.feature_mode}  "
                      f"R_list={R_list}  C={args.cluster_batch} G={args.G} P={args.P} N={args.N}")
-        logger.info(f"τ={args.temperature}  λ_div={args.lambda_diversity}  λ_reg={args.lambda_reg}  λ_intra={args.lambda_intra}  λ_tgt={args.lambda_target}")
+        logger.info(f"τ={args.temperature}  λ_div={args.lambda_diversity}  λ_reg={args.lambda_reg}  λ_intra={args.lambda_intra}  λ_tgt={args.lambda_target}  max_bs={args.max_body_scale}")
         logger.info(f"Training for {args.max_steps} steps …")
 
     # ======================== Main loop ========================
@@ -302,7 +302,7 @@ def train(args):
         G = args.G
 
         drift_w = min(1.0, max(0.0, (step - args.drift_warmup) / max(args.drift_warmup, 1)))
-        body_scale = max(0.1, drift_w)
+        body_scale = min(args.max_body_scale, max(0.1, drift_w))
 
         # 1. Sample clusters
         sampled = np.random.choice(valid_clusters, size=C, replace=False)
@@ -568,6 +568,8 @@ if __name__ == "__main__":
     p.add_argument("--grad_clip", type=float, default=5.0)
     p.add_argument("--drift_warmup", type=int, default=3000,
                    help="Steps before drift loss fully activates (curriculum)")
+    p.add_argument("--max_body_scale", type=float, default=1.0,
+                   help="Cap body_scale to keep offsets dominant (0.25 prevents token collapse)")
     p.add_argument("--pos_noise", type=float, default=0.0,
                    help="Per-position noise added to generator output (breaks position collapse)")
 
