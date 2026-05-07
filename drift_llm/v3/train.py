@@ -1,0 +1,398 @@
+"""
+v3 Text Drifting: unconditional text generation via embedding-space drift loss.
+
+Design:
+- Generator outputs continuous embeddings in GPT-2's word-embedding space
+- Frozen GPT-2 extracts semantic features from these embeddings (differentiable)
+- K-means on GPT-2 features provides pseudo-class clusters for memory bank
+- Pure drift loss (no CE) with per-cluster positive/negative sampling
+- Decode to text via nearest-neighbor cosine similarity to vocab embeddings
+
+Usage:
+    # 1. Preprocess (single GPU — computes features + clusters)
+    python train.py --mode preprocess
+
+    # 2. Train (multi-GPU DDP)
+    CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun --nproc_per_node=6 train.py --mode train --wandb_project drift-llm-v3
+"""
+
+import argparse
+import logging
+import math
+import os
+import sys
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+from transformers import AutoTokenizer, GPT2Model
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from v3.model import EmbeddingGenerator
+from drift_loss import drift_loss
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def is_main():
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def cosine_lr(step, max_steps, warmup, peak_lr):
+    if step < warmup:
+        return peak_lr * step / max(warmup, 1)
+    t = (step - warmup) / max(max_steps - warmup, 1)
+    return peak_lr * 0.5 * (1 + math.cos(math.pi * t))
+
+
+# ======================== Preprocessing ========================
+
+def preprocess(args):
+    """Compute GPT-2 features for dataset, then K-means cluster."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---- Load data ----
+    logger.info("Loading AG News …")
+    from datasets import load_dataset
+    ds = load_dataset("ag_news", split="train")
+    texts = ds["text"]
+    gt_labels = np.array(ds["label"])
+
+    # ---- Tokenize ----
+    logger.info("Tokenizing …")
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    tok.pad_token = tok.eos_token
+
+    all_ids, all_masks = [], []
+    for i in range(0, len(texts), 1024):
+        enc = tok(
+            texts[i : i + 1024],
+            max_length=args.seq_len,
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt",
+        )
+        all_ids.append(enc["input_ids"])
+        all_masks.append(enc["attention_mask"])
+    token_ids = torch.cat(all_ids)
+    masks = torch.cat(all_masks)
+    logger.info(f"  {token_ids.shape[0]} samples, seq_len={token_ids.shape[1]}")
+
+    # ---- GPT-2 features ----
+    logger.info("Extracting GPT-2 features …")
+    gpt2 = GPT2Model.from_pretrained("gpt2").to(device).eval()
+    feats = []
+    bs = 256
+    for i in range(0, len(token_ids), bs):
+        ids = token_ids[i : i + bs].to(device)
+        m = masks[i : i + bs].to(device)
+        with torch.no_grad():
+            h = gpt2(input_ids=ids, attention_mask=m).last_hidden_state
+            mf = m.unsqueeze(-1).float()
+            feats.append(((h * mf).sum(1) / mf.sum(1).clamp(min=1)).cpu())
+        if (i // bs) % 100 == 0:
+            logger.info(f"    {i}/{len(token_ids)}")
+    features = torch.cat(feats)
+    logger.info(f"  Features: {features.shape}")
+
+    # ---- K-means ----
+    K = args.num_clusters
+    logger.info(f"K-means (K={K}) …")
+    from sklearn.cluster import MiniBatchKMeans
+    km = MiniBatchKMeans(n_clusters=K, batch_size=2048, n_init=3, random_state=42)
+    cluster_ids = torch.tensor(km.fit_predict(features.numpy()), dtype=torch.long)
+    _, counts = np.unique(cluster_ids.numpy(), return_counts=True)
+    logger.info(f"  Cluster sizes: min={counts.min()} max={counts.max()} "
+                f"mean={counts.mean():.0f} median={int(np.median(counts))}")
+
+    # ---- Save ----
+    os.makedirs(args.cache_dir, exist_ok=True)
+    path = os.path.join(args.cache_dir, "preprocessed.pt")
+    torch.save(dict(
+        token_ids=token_ids,
+        masks=masks,
+        features=features,
+        cluster_ids=cluster_ids,
+        gt_labels=torch.tensor(gt_labels),
+        num_clusters=K,
+    ), path)
+    logger.info(f"Saved → {path}")
+
+
+# ======================== Feature helpers ========================
+
+def gpt2_features(gpt2, embeddings):
+    """Differentiable feature extraction: continuous embs → GPT-2 → mean-pool.
+
+    Args:
+        gpt2: frozen GPT2Model
+        embeddings: [B, L, 768] continuous (has grad from generator)
+    Returns:
+        [B, 768] feature vectors (has grad)
+    """
+    h = gpt2(inputs_embeds=embeddings).last_hidden_state  # [B, L, 768]
+    return h.mean(dim=1)
+
+
+def gpt2_multiscale_features(gpt2, embeddings):
+    """Multi-layer features: layers 3, 6, 9, 12 → concat mean-pools → [B, 3072].
+
+    Provides richer signal than a single layer (analogous to MAE multi-scale in image drifting).
+    """
+    out = gpt2(inputs_embeds=embeddings, output_hidden_states=True)
+    parts = []
+    for idx in [3, 6, 9, 12]:
+        parts.append(out.hidden_states[idx].mean(dim=1))
+    return torch.cat(parts, dim=-1)
+
+
+# ======================== Training ========================
+
+def train(args):
+    # ---- DDP ----
+    ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    if ddp:
+        dist.init_process_group("nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        local_rank = 0
+
+    # ---- Load preprocessed data ----
+    data_path = os.path.join(args.cache_dir, "preprocessed.pt")
+    if not os.path.exists(data_path):
+        if is_main():
+            preprocess(args)
+        if ddp:
+            dist.barrier()
+
+    data = torch.load(data_path, map_location="cpu", weights_only=False)
+    all_features = data["features"]                # [N, D_feat]
+    cluster_ids = data["cluster_ids"]              # [N]
+    token_ids = data["token_ids"]                  # [N, L]
+    num_clusters = int(data["num_clusters"])
+    D_feat = all_features.shape[1]
+
+    # per-cluster index lists
+    cluster_idx = {}
+    for c in range(num_clusters):
+        idx = (cluster_ids == c).nonzero(as_tuple=True)[0]
+        if len(idx) > 0:
+            cluster_idx[c] = idx
+    valid_clusters = np.array(sorted(cluster_idx.keys()))
+
+    all_features_gpu = all_features.to(device)
+    if is_main():
+        logger.info(f"Data: {all_features.shape[0]} samples, {len(valid_clusters)} non-empty clusters, "
+                     f"feat_dim={D_feat}")
+
+    # ---- Models ----
+    generator = EmbeddingGenerator(
+        emb_dim=768, d_model=args.d_model, n_layers=args.n_layers,
+        n_heads=args.n_heads, seq_len=args.seq_len, dropout=args.dropout,
+    ).to(device)
+    if ddp:
+        generator = DDP(generator, device_ids=[local_rank])
+    raw_gen = generator.module if ddp else generator
+
+    gpt2 = GPT2Model.from_pretrained("gpt2").to(device).eval()
+    for p in gpt2.parameters():
+        p.requires_grad = False
+    vocab_emb = gpt2.wte.weight.detach()           # [V, 768]
+
+    n_params = sum(p.numel() for p in raw_gen.parameters()) / 1e6
+    if is_main():
+        logger.info(f"Generator: {n_params:.1f}M params  |  GPT-2 frozen for features")
+
+    # ---- Optim / schedule ----
+    optimizer = torch.optim.AdamW(generator.parameters(), lr=args.lr, weight_decay=0.01)
+    R_list = tuple(args.R_list)
+
+    # ---- WandB ----
+    if args.wandb_project and is_main():
+        import wandb
+        wandb.init(
+            project=args.wandb_project,
+            name=f"v3_d{args.d_model}_L{args.n_layers}_K{num_clusters}_G{args.G}",
+            config=vars(args),
+        )
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    tok.pad_token = tok.eos_token
+
+    use_multiscale = args.multiscale
+    feat_fn = gpt2_multiscale_features if use_multiscale else gpt2_features
+    if is_main():
+        logger.info(f"Features: {'multiscale (4-layer)' if use_multiscale else 'last-layer mean'}  "
+                     f"R_list={R_list}  C={args.cluster_batch} G={args.G} P={args.P} N={args.N}")
+        logger.info(f"Training for {args.max_steps} steps …")
+
+    # ======================== Main loop ========================
+    for step in range(1, args.max_steps + 1):
+        generator.train()
+        lr = cosine_lr(step, args.max_steps, args.warmup_steps, args.lr)
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr
+
+        C = args.cluster_batch
+        G = args.G
+
+        # 1. Sample clusters
+        sampled = np.random.choice(valid_clusters, size=C, replace=False)
+
+        # 2. Generate C*G embeddings
+        noise = torch.randn(C * G, args.seq_len, args.d_model, device=device)
+        gen_emb = generator(noise)                   # [C*G, L, 768]  (has grad)
+
+        # 3. Features through frozen GPT-2 (differentiable)
+        gen_feat = feat_fn(gpt2, gen_emb)            # [C*G, D_feat]  (has grad)
+        gen_feat = gen_feat.view(C, G, -1)           # [C, G, D_feat]
+
+        # 4. Positive / negative from pre-computed bank
+        pos = torch.zeros(C, args.P, D_feat, device=device)
+        neg = torch.zeros(C, args.N, D_feat, device=device)
+        for i, c in enumerate(sampled):
+            ci = cluster_idx[c]
+            pos[i] = all_features_gpu[ci[torch.randint(len(ci), (args.P,))]]
+            neg[i] = all_features_gpu[torch.randint(len(all_features), (args.N,))]
+
+        # 5. Drift loss
+        loss, info = drift_loss(gen=gen_feat, fixed_pos=pos, fixed_neg=neg, R_list=R_list)
+        total_loss = loss.mean()
+
+        # 6. Backward + step
+        optimizer.zero_grad()
+        total_loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
+        optimizer.step()
+
+        # ---- Logging ----
+        if step % args.log_every == 0 and is_main():
+            scale = info.get("scale", torch.tensor(0.0))
+            scale_val = scale.item() if isinstance(scale, torch.Tensor) else scale
+            logger.info(
+                f"step={step:>6}/{args.max_steps}  loss={total_loss.item():.4f}  "
+                f"scale={scale_val:.4f}  gnorm={grad_norm:.3f}  lr={lr:.2e}"
+            )
+            if args.wandb_project:
+                import wandb
+                m = {"loss": total_loss.item(), "lr": lr, "grad_norm": grad_norm, "step": step}
+                for k, v in info.items():
+                    m[f"drift/{k}"] = v.item() if isinstance(v, torch.Tensor) else v
+                wandb.log(m)
+
+        # ---- Eval ----
+        if (step % args.eval_every == 0 or step == args.max_steps) and is_main():
+            _evaluate(raw_gen, gpt2, vocab_emb, all_features_gpu, token_ids, tok,
+                      args, step, device, use_multiscale)
+
+        # ---- Save ----
+        if (step % args.save_every == 0 or step == args.max_steps) and is_main():
+            p_ = os.path.join(args.output_dir, f"step_{step}.pt")
+            torch.save(dict(step=step, model=raw_gen.state_dict(), args=vars(args)), p_)
+            logger.info(f"Saved → {p_}")
+
+    if ddp:
+        dist.destroy_process_group()
+    if is_main():
+        logger.info("Done.")
+
+
+# ======================== Evaluation ========================
+
+@torch.no_grad()
+def _evaluate(gen, gpt2, vocab_emb, all_feats, token_ids, tok, args, step, device,
+              use_multiscale):
+    gen.eval()
+    feat_fn = gpt2_multiscale_features if use_multiscale else gpt2_features
+
+    n_samples = 16
+    noise = torch.randn(n_samples, args.seq_len, args.d_model, device=device)
+    emb = gen(noise)                                 # [n, L, 768]
+    tokens = gen.decode_to_tokens(emb, vocab_emb)    # [n, L]
+    feats = feat_fn(gpt2, emb)                       # [n, D]
+
+    logger.info("─── Generated samples ───")
+    table_rows = []
+    for j in range(n_samples):
+        text = tok.decode(tokens[j], skip_special_tokens=True)
+        # nearest real sample (by feature distance)
+        d = torch.cdist(feats[j : j + 1], all_feats)
+        nearest_idx = d.argmin(dim=-1).item()
+        near_text = tok.decode(token_ids[nearest_idx], skip_special_tokens=True)
+        logger.info(f"  [{j:2d}] {text[:140]}")
+        if j < 4:
+            logger.info(f"       nearest: {near_text[:140]}")
+        table_rows.append((text[:200], near_text[:200]))
+
+    # Diversity: unique unigrams / total tokens
+    all_tokens = tokens.cpu().tolist()
+    flat = [t for seq in all_tokens for t in seq]
+    diversity = len(set(flat)) / max(len(flat), 1)
+    logger.info(f"  Vocab diversity (unique / total): {diversity:.3f}")
+
+    # Entropy of token distribution
+    counts = torch.bincount(tokens.view(-1).cpu(), minlength=len(tok))
+    p = counts.float() / counts.sum()
+    p = p[p > 0]
+    entropy = -(p * p.log()).sum().item()
+    logger.info(f"  Token entropy: {entropy:.2f}  (uniform={math.log(len(tok)):.2f})")
+
+    if args.wandb_project:
+        import wandb
+        tbl = wandb.Table(columns=["step", "idx", "generated", "nearest_real"])
+        for j, (gt, nt) in enumerate(table_rows):
+            tbl.add_data(step, j, gt, nt)
+        wandb.log({"samples": tbl, "eval/diversity": diversity,
+                   "eval/entropy": entropy, "step": step})
+
+
+# ======================== CLI ========================
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", default="train", choices=["preprocess", "train"])
+
+    # data
+    p.add_argument("--seq_len", type=int, default=32)
+    p.add_argument("--num_clusters", type=int, default=256)
+    p.add_argument("--cache_dir", default="data/v3_cache")
+
+    # generator arch
+    p.add_argument("--d_model", type=int, default=768)
+    p.add_argument("--n_layers", type=int, default=8)
+    p.add_argument("--n_heads", type=int, default=8)
+    p.add_argument("--dropout", type=float, default=0.0)
+
+    # drift hyper-params (following image drifting defaults)
+    p.add_argument("--G", type=int, default=16, help="generators per cluster")
+    p.add_argument("--P", type=int, default=32, help="positive samples per cluster")
+    p.add_argument("--N", type=int, default=16, help="negative samples per cluster")
+    p.add_argument("--cluster_batch", type=int, default=8, help="clusters per step")
+    p.add_argument("--R_list", type=float, nargs="+", default=[0.02, 0.05, 0.2])
+    p.add_argument("--multiscale", action="store_true",
+                   help="Use multi-layer GPT-2 features (4×768=3072-dim)")
+
+    # optim
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--warmup_steps", type=int, default=1000)
+    p.add_argument("--max_steps", type=int, default=50000)
+
+    # logging / saving
+    p.add_argument("--log_every", type=int, default=50)
+    p.add_argument("--eval_every", type=int, default=2000)
+    p.add_argument("--save_every", type=int, default=10000)
+    p.add_argument("--output_dir", default="runs/v3")
+    p.add_argument("--wandb_project", default=None)
+
+    args = p.parse_args()
+    if args.mode == "preprocess":
+        preprocess(args)
+    else:
+        train(args)
