@@ -293,12 +293,18 @@ def train(args):
         C = args.cluster_batch
         G = args.G
 
+        # body_scale: transformer body output ramps from 0→1 during drift warmup
+        # Phase 1: output = pos_offset only (guarantees position diversity)
+        # Phase 2: transformer gradually gains influence
+        drift_w = min(1.0, max(0.0, (step - args.drift_warmup) / max(args.drift_warmup, 1)))
+        body_scale = drift_w
+
         # 1. Sample clusters
         sampled = np.random.choice(valid_clusters, size=C, replace=False)
 
         # 2. Generate C*G hidden states → soft-vocabulary → embeddings
         noise = torch.randn(C * G, args.seq_len, args.d_model, device=device)
-        gen_h_raw = generator(noise)                  # [C*G, L, d_model]  (has grad)
+        gen_h_raw = generator(noise, body_scale=body_scale)  # [C*G, L, d_model]
         if args.pos_noise > 0:
             gen_h = gen_h_raw + args.pos_noise * torch.randn_like(gen_h_raw)
         else:
@@ -361,7 +367,6 @@ def train(args):
         target_loss = -target_cos.mean()
 
         # Curriculum: phase 1 = target only, phase 2 = drift + reg
-        drift_w = min(1.0, max(0.0, (step - args.drift_warmup) / max(args.drift_warmup, 1)))
         target_w = 1.0 - drift_w
         total_loss = (drift_w * (drift_val + args.lambda_diversity * div_loss + args.lambda_reg * reg_loss)
                       + args.lambda_intra * intra_loss
@@ -394,7 +399,7 @@ def train(args):
                 f"step={step:>6}/{args.max_steps}  loss={total_loss.item():.4f}  "
                 f"drift={drift_val.item():.4f}  div={div_loss.item():.4f}  "
                 f"reg={reg_loss.item():.4f}  tgt={target_loss.item():.4f}  "
-                f"pvar={pos_var.item():.4f}  dw={drift_w:.2f}  {extra}  "
+                f"pvar={pos_var.item():.4f}  dw={drift_w:.2f}  bs={body_scale:.3f}  {extra}  "
                 f"raw_cos={raw_max_cos:.3f}  uniq={mean_uniq:.1f}/{args.seq_len}  "
                 f"gnorm={grad_norm:.3f}  lr={lr:.2e}"
             )
@@ -408,6 +413,7 @@ def train(args):
                 m["mean_max_cosine"] = -reg_loss.item()
                 m["raw_max_cosine"] = raw_max_cos
                 m["unique_tokens_per_seq"] = mean_uniq
+                m["body_scale"] = body_scale
                 if args.feature_mode in ("gpt2_soft", "emb_stats"):
                     m["softmax_entropy"] = ent_val
                 for k, v in info.items():

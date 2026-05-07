@@ -119,10 +119,11 @@ class EmbeddingGenerator(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, noise):
+    def forward(self, noise, body_scale=1.0):
         """
         Args:
             noise: [B, seq_len, noise_dim]
+            body_scale: float, scales transformer body output (0=pos_offset only)
         Returns:
             embeddings: [B, seq_len, emb_dim]
         """
@@ -131,7 +132,8 @@ class EmbeddingGenerator(nn.Module):
         cos, sin = self.rotary(self.seq_len, device=h.device)
         for block in self.blocks:
             h = block(h, cos, sin)
-        return self.output_proj(self.ln_f(h)) + self.pos_offset
+        body = self.output_proj(self.ln_f(h))
+        return body_scale * body + self.pos_offset
 
     @torch.no_grad()
     def decode_to_tokens(self, embeddings, vocab_embeddings):
