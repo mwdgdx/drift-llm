@@ -1,18 +1,12 @@
 """
 v3 Text Drifting: unconditional text generation via embedding-space drift loss.
 
-Design:
-- Generator outputs continuous embeddings in GPT-2's word-embedding space
-- Embedding statistics (mean, std, chunk means) as differentiable features
-- K-means on GPT-2 features provides pseudo-class clusters for memory bank
-- Pure drift loss (no CE) with per-cluster positive/negative sampling
-- Decode to text via nearest-neighbor cosine similarity to vocab embeddings
+Two feature modes:
+  gpt2_ste: STE + frozen GPT-2 features (meaningful sequential features, good gradients)
+  emb_stats: Embedding statistics (fast, no model forward, but bag-of-words)
 
 Usage:
-    # 1. Preprocess (single GPU — computes features + clusters)
     python train.py --mode preprocess
-
-    # 2. Train (multi-GPU DDP)
     CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun --nproc_per_node=6 train.py --mode train
 """
 
@@ -149,6 +143,19 @@ def emb_stats_features(embeddings, n_chunks=8):
     return torch.cat(parts, dim=-1)
 
 
+def gpt2_ste_features(gpt2, logits, vocab_emb, temperature):
+    """STE + GPT-2: hard tokens in forward (meaningful features), soft gradient in backward.
+
+    Forward: argmax → real token embeddings → GPT-2 → mean pool (768-dim)
+    Backward: gradient flows through soft_emb via straight-through estimator
+    """
+    soft_emb = F.softmax(logits / temperature, dim=-1) @ vocab_emb
+    hard_emb = vocab_emb[logits.argmax(dim=-1)]
+    ste_emb = hard_emb + (soft_emb - soft_emb.detach())
+    h = gpt2(inputs_embeds=ste_emb).last_hidden_state
+    return h.mean(dim=1)
+
+
 # ======================== Training ========================
 
 def train(args):
@@ -193,27 +200,41 @@ def train(args):
         generator = DDP(generator, device_ids=[local_rank])
     raw_gen = generator.module if ddp else generator
 
-    _gpt2 = GPT2Model.from_pretrained("gpt2")
-    vocab_emb = _gpt2.wte.weight.detach().clone().to(device)  # [V, 768]
-    del _gpt2
+    use_gpt2_ste = (args.feature_mode == "gpt2_ste")
+
+    if use_gpt2_ste:
+        gpt2 = GPT2Model.from_pretrained("gpt2").to(device).eval()
+        for p in gpt2.parameters():
+            p.requires_grad = False
+        vocab_emb = gpt2.wte.weight.detach()           # [V, 768]
+    else:
+        _gpt2 = GPT2Model.from_pretrained("gpt2")
+        vocab_emb = _gpt2.wte.weight.detach().clone().to(device)
+        del _gpt2
+        gpt2 = None
 
     n_params = sum(p.numel() for p in raw_gen.parameters()) / 1e6
     if is_main():
-        logger.info(f"Generator: {n_params:.1f}M params  |  Embedding stats features")
+        logger.info(f"Generator: {n_params:.1f}M params  |  Feature mode: {args.feature_mode}")
 
-    # ---- Precompute memory bank features using embedding statistics ----
-    if is_main():
-        logger.info("Computing embedding stats features for memory bank …")
-    emb_bank_bs = 1024
-    all_feat_parts = []
-    for i in range(0, len(token_ids), emb_bank_bs):
-        ids_batch = token_ids[i : i + emb_bank_bs].to(device)
-        emb_batch = vocab_emb[ids_batch]            # [bs, L, 768]
-        feat_batch = emb_stats_features(emb_batch)  # [bs, D_feat]
-        all_feat_parts.append(feat_batch.cpu())
-    all_features = torch.cat(all_feat_parts)         # [N, D_feat]
-    all_features_gpu = all_features.to(device)
-    D_feat = all_features.shape[1]
+    # ---- Memory bank features ----
+    if use_gpt2_ste:
+        all_features = data["features"]  # pre-computed GPT-2 mean pool (768-dim)
+        all_features_gpu = all_features.to(device)
+        D_feat = all_features.shape[1]
+    else:
+        if is_main():
+            logger.info("Computing embedding stats features for memory bank …")
+        emb_bank_bs = 1024
+        all_feat_parts = []
+        for i in range(0, len(token_ids), emb_bank_bs):
+            ids_batch = token_ids[i : i + emb_bank_bs].to(device)
+            emb_batch = vocab_emb[ids_batch]
+            feat_batch = emb_stats_features(emb_batch)
+            all_feat_parts.append(feat_batch.cpu())
+        all_features = torch.cat(all_feat_parts)
+        all_features_gpu = all_features.to(device)
+        D_feat = all_features.shape[1]
     if is_main():
         logger.info(f"Data: {all_features.shape[0]} samples, {len(valid_clusters)} non-empty clusters, "
                      f"feat_dim={D_feat}")
@@ -236,7 +257,7 @@ def train(args):
     tok.pad_token = tok.eos_token
 
     if is_main():
-        logger.info(f"Features: emb_stats (mean+std+8chunks+bigram)  "
+        logger.info(f"Features: {args.feature_mode}  "
                      f"R_list={R_list}  C={args.cluster_batch} G={args.G} P={args.P} N={args.N}")
         logger.info(f"Soft-vocab τ={args.temperature}  λ_div={args.lambda_diversity}")
         logger.info(f"Training for {args.max_steps} steps …")
@@ -258,13 +279,16 @@ def train(args):
         noise = torch.randn(C * G, args.seq_len, args.d_model, device=device)
         gen_h = generator(noise)                     # [C*G, L, d_model]  (has grad)
 
-        # Soft vocabulary projection: keeps output on embedding manifold
+        # Soft vocabulary projection
         logits = gen_h @ vocab_emb.T                 # [C*G, L, V]
-        soft_probs = F.softmax(logits / args.temperature, dim=-1)
-        gen_emb = soft_probs @ vocab_emb             # [C*G, L, 768]
 
-        # 3. Embedding statistics features (differentiable, no model forward)
-        gen_feat = emb_stats_features(gen_emb)       # [C*G, D_feat]  (has grad)
+        # 3. Features
+        if use_gpt2_ste:
+            gen_feat = gpt2_ste_features(gpt2, logits, vocab_emb, args.temperature)
+        else:
+            soft_probs = F.softmax(logits / args.temperature, dim=-1)
+            gen_emb = soft_probs @ vocab_emb
+            gen_feat = emb_stats_features(gen_emb)
         gen_feat = gen_feat.view(C, G, -1)           # [C, G, D_feat]
 
         # 4. Positive / negative from pre-computed bank
@@ -294,9 +318,9 @@ def train(args):
         if step % args.log_every == 0 and is_main():
             scale = info.get("scale", torch.tensor(0.0))
             scale_val = scale.item() if isinstance(scale, torch.Tensor) else scale
-            # softmax entropy (how peaked the token distribution is)
             with torch.no_grad():
-                ent = -(soft_probs * soft_probs.clamp(min=1e-8).log()).sum(-1).mean()
+                sp = F.softmax(logits / args.temperature, dim=-1)
+                ent = -(sp * sp.clamp(min=1e-8).log()).sum(-1).mean()
             logger.info(
                 f"step={step:>6}/{args.max_steps}  loss={total_loss.item():.4f}  "
                 f"drift={drift_val.item():.4f}  div={div_loss.item():.4f}  "
@@ -315,7 +339,7 @@ def train(args):
 
         # ---- Eval ----
         if (step % args.eval_every == 0 or step == args.max_steps) and is_main():
-            _evaluate(raw_gen, vocab_emb, all_features_gpu, token_ids, tok,
+            _evaluate(raw_gen, gpt2, vocab_emb, all_features_gpu, token_ids, tok,
                       args, step, device)
 
         # ---- Save ----
@@ -333,18 +357,22 @@ def train(args):
 # ======================== Evaluation ========================
 
 @torch.no_grad()
-def _evaluate(gen, vocab_emb, all_feats, token_ids, tok, args, step, device):
+def _evaluate(gen, gpt2, vocab_emb, all_feats, token_ids, tok, args, step, device):
     gen.eval()
 
     n_samples = 16
     noise = torch.randn(n_samples, args.seq_len, args.d_model, device=device)
     gen_h = gen(noise)                               # [n, L, d_model]
 
-    # Soft-vocab decode
     logits = gen_h @ vocab_emb.T                     # [n, L, V]
     tokens = logits.argmax(dim=-1)                   # [n, L]
-    soft_emb = F.softmax(logits / args.temperature, dim=-1) @ vocab_emb
-    feats = emb_stats_features(soft_emb)             # [n, D_feat]
+
+    if args.feature_mode == "gpt2_ste" and gpt2 is not None:
+        emb = vocab_emb[tokens]
+        feats = gpt2(inputs_embeds=emb).last_hidden_state.mean(dim=1)
+    else:
+        soft_emb = F.softmax(logits / args.temperature, dim=-1) @ vocab_emb
+        feats = emb_stats_features(soft_emb)
 
     logger.info("─── Generated samples ───")
     table_rows = []
@@ -404,6 +432,9 @@ if __name__ == "__main__":
     p.add_argument("--N", type=int, default=16, help="negative samples per cluster")
     p.add_argument("--cluster_batch", type=int, default=8, help="clusters per step")
     p.add_argument("--R_list", type=float, nargs="+", default=[0.02, 0.05, 0.2])
+    p.add_argument("--feature_mode", type=str, default="gpt2_ste",
+                   choices=["gpt2_ste", "emb_stats"],
+                   help="Feature extraction: gpt2_ste (STE + GPT-2) or emb_stats (embedding statistics)")
     p.add_argument("--temperature", type=float, default=1.0,
                    help="Softmax temperature for soft-vocab projection (higher=softer)")
     p.add_argument("--lambda_diversity", type=float, default=1.0,
