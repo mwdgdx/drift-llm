@@ -320,9 +320,9 @@ def train(args):
         feat_std = gen_feat.std(dim=1).mean()
         div_loss = -feat_std
 
-        # 7. Intra-sequence diversity: penalize repeated tokens at every position
-        pos_var = gen_h.var(dim=1).mean()  # variance across positions within each sequence
-        intra_loss = -pos_var
+        # 7. Intra-sequence diversity: log-variance has strong gradients near collapse
+        pos_var = gen_h.var(dim=1).mean().clamp(min=1e-8)
+        intra_loss = -torch.log(pos_var)
 
         total_loss = (drift_val + args.lambda_diversity * div_loss
                       + args.lambda_reg * reg_loss + args.lambda_intra * intra_loss)
