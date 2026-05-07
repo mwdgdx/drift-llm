@@ -204,7 +204,7 @@ def train(args):
         generator = DDP(generator, device_ids=[local_rank])
     raw_gen = generator.module if ddp else generator
 
-    need_gpt2 = args.feature_mode in ("gpt2_soft", "gpt2_direct")
+    need_gpt2 = args.feature_mode in ("gpt2_quantized", "gpt2_soft", "gpt2_direct")
 
     if need_gpt2:
         gpt2 = GPT2Model.from_pretrained("gpt2").to(device).eval()
@@ -290,7 +290,15 @@ def train(args):
         max_cos = cos_sim.max(dim=-1).values           # [C*G*L]
         reg_loss = -max_cos.mean()
 
-        if args.feature_mode == "gpt2_direct":
+        if args.feature_mode == "gpt2_quantized":
+            # Forward: project to nearest tokens so GPT-2 sees real embeddings
+            # Backward: STE — gradients flow through gen_h
+            with torch.no_grad():
+                nearest = raw_gen.decode_to_tokens(gen_h, vocab_emb)
+                gen_projected = vocab_emb[nearest]
+            gen_input = gen_h + (gen_projected - gen_h).detach()  # STE
+            gen_feat = gpt2(inputs_embeds=gen_input).last_hidden_state.mean(dim=1)
+        elif args.feature_mode == "gpt2_direct":
             gen_feat = gpt2(inputs_embeds=gen_h).last_hidden_state.mean(dim=1)
         elif args.feature_mode == "direct":
             gen_feat = emb_stats_features(gen_h)
@@ -392,7 +400,7 @@ def _evaluate(gen, gpt2, vocab_emb, all_feats, token_ids, tok, args, step, devic
     gen_h = gen(noise)                               # [n, L, d_model]
 
     tokens = gen.decode_to_tokens(gen_h, vocab_emb)
-    if args.feature_mode in ("gpt2_direct", "gpt2_soft") and gpt2 is not None:
+    if args.feature_mode in ("gpt2_quantized", "gpt2_direct", "gpt2_soft") and gpt2 is not None:
         emb = vocab_emb[tokens]
         feats = gpt2(inputs_embeds=emb).last_hidden_state.mean(dim=1)
     elif args.feature_mode == "direct":
@@ -459,9 +467,10 @@ if __name__ == "__main__":
     p.add_argument("--N", type=int, default=16, help="negative samples per cluster")
     p.add_argument("--cluster_batch", type=int, default=8, help="clusters per step")
     p.add_argument("--R_list", type=float, nargs="+", default=[0.02, 0.05, 0.2])
-    p.add_argument("--feature_mode", type=str, default="gpt2_direct",
-                   choices=["gpt2_direct", "direct", "gpt2_soft", "emb_stats"],
-                   help="Feature mode: gpt2_direct (gen→GPT-2, no softmax), direct, gpt2_soft, emb_stats")
+    p.add_argument("--feature_mode", type=str, default="gpt2_quantized",
+                   choices=["gpt2_quantized", "gpt2_direct", "direct", "gpt2_soft", "emb_stats"],
+                   help="gpt2_quantized: quantize to nearest tokens → GPT-2 (STE backward)")
+
     p.add_argument("--temperature", type=float, default=3.0,
                    help="Softmax temperature for soft-vocab projection (higher=softer)")
     p.add_argument("--top_k", type=int, default=0,
