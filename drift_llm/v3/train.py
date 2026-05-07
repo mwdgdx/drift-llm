@@ -360,11 +360,11 @@ def train(args):
         target_cos = (gen_h_dir * target_embs.unsqueeze(0)).sum(dim=-1)  # [C*G, L]
         target_loss = -target_cos.mean()
 
-        # Curriculum: target loss fades as drift activates
+        # Curriculum: phase 1 = target only, phase 2 = drift + reg
         drift_w = min(1.0, max(0.0, (step - args.drift_warmup) / max(args.drift_warmup, 1)))
         target_w = 1.0 - drift_w
-        total_loss = (drift_w * (drift_val + args.lambda_diversity * div_loss)
-                      + args.lambda_reg * reg_loss + args.lambda_intra * intra_loss
+        total_loss = (drift_w * (drift_val + args.lambda_diversity * div_loss + args.lambda_reg * reg_loss)
+                      + args.lambda_intra * intra_loss
                       + target_w * args.lambda_target * target_loss)
 
         # 7. Backward + step
