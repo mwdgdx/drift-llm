@@ -218,10 +218,21 @@ def train(args):
         gpt2 = None
 
     with torch.no_grad():
-        sampled_tok = torch.randint(0, vocab_emb.shape[0], (args.seq_len,))
-        raw_gen.pos_offset.copy_(vocab_emb[sampled_tok])
+        vn = F.normalize(vocab_emb, dim=-1)
+        target_ids = [torch.randint(0, vocab_emb.shape[0], (1,)).item()]
+        for _ in range(args.seq_len - 1):
+            cur = vn[target_ids]
+            sims = cur @ vn.T
+            min_sim = sims.min(dim=0).values
+            target_ids.append(min_sim.argmin().item())
+        target_ids = torch.tensor(target_ids, device=device)
+        target_embs = F.normalize(vocab_emb[target_ids], dim=-1)
+        raw_gen.pos_offset.copy_(vocab_emb[target_ids])
+    if ddp:
+        dist.broadcast(target_embs, src=0)
+        dist.broadcast(raw_gen.pos_offset.data, src=0)
     if is_main():
-        logger.info(f"Initialized pos_offset from {args.seq_len} random token embeddings")
+        logger.info(f"Selected {args.seq_len} maximally-spread target tokens for position diversity")
 
     n_params = sum(p.numel() for p in raw_gen.parameters()) / 1e6
     if is_main():
@@ -269,7 +280,7 @@ def train(args):
     if is_main():
         logger.info(f"Features: {args.feature_mode}  "
                      f"R_list={R_list}  C={args.cluster_batch} G={args.G} P={args.P} N={args.N}")
-        logger.info(f"τ={args.temperature}  λ_div={args.lambda_diversity}  λ_reg={args.lambda_reg}  λ_intra={args.lambda_intra}")
+        logger.info(f"τ={args.temperature}  λ_div={args.lambda_diversity}  λ_reg={args.lambda_reg}  λ_intra={args.lambda_intra}  λ_tgt={args.lambda_target}")
         logger.info(f"Training for {args.max_steps} steps …")
 
     # ======================== Main loop ========================
@@ -343,10 +354,18 @@ def train(args):
         pos_var = gen_h_raw.var(dim=1).mean().clamp(min=1e-8)
         intra_loss = -torch.log(pos_var)
 
-        # Curriculum: ramp drift loss in after drift_warmup steps
+        # 8. Target direction loss: push position i toward target token i
+        #    Has non-zero gradient even at the dead point (all positions identical)
+        gen_h_dir = F.normalize(gen_h_raw, dim=-1)             # [C*G, L, 768]
+        target_cos = (gen_h_dir * target_embs.unsqueeze(0)).sum(dim=-1)  # [C*G, L]
+        target_loss = -target_cos.mean()
+
+        # Curriculum: target loss fades as drift activates
         drift_w = min(1.0, max(0.0, (step - args.drift_warmup) / max(args.drift_warmup, 1)))
+        target_w = 1.0 - drift_w
         total_loss = (drift_w * (drift_val + args.lambda_diversity * div_loss)
-                      + args.lambda_reg * reg_loss + args.lambda_intra * intra_loss)
+                      + args.lambda_reg * reg_loss + args.lambda_intra * intra_loss
+                      + target_w * args.lambda_target * target_loss)
 
         # 7. Backward + step
         optimizer.zero_grad()
@@ -374,7 +393,7 @@ def train(args):
             logger.info(
                 f"step={step:>6}/{args.max_steps}  loss={total_loss.item():.4f}  "
                 f"drift={drift_val.item():.4f}  div={div_loss.item():.4f}  "
-                f"reg={reg_loss.item():.4f}  intra={intra_loss.item():.4f}  "
+                f"reg={reg_loss.item():.4f}  tgt={target_loss.item():.4f}  "
                 f"pvar={pos_var.item():.4f}  dw={drift_w:.2f}  {extra}  "
                 f"raw_cos={raw_max_cos:.3f}  uniq={mean_uniq:.1f}/{args.seq_len}  "
                 f"gnorm={grad_norm:.3f}  lr={lr:.2e}"
@@ -383,8 +402,8 @@ def train(args):
                 import wandb
                 m = {"loss": total_loss.item(), "drift_loss": drift_val.item(),
                      "diversity_loss": div_loss.item(), "feat_std": feat_std.item(),
-                     "reg_loss": reg_loss.item(), "intra_loss": intra_loss.item(),
-                     "pos_variance": pos_var.item(),
+                     "reg_loss": reg_loss.item(), "target_loss": target_loss.item(),
+                     "intra_loss": intra_loss.item(), "pos_variance": pos_var.item(),
                      "lr": lr, "grad_norm": grad_norm, "step": step}
                 m["mean_max_cosine"] = -reg_loss.item()
                 m["raw_max_cosine"] = raw_max_cos
@@ -504,6 +523,8 @@ if __name__ == "__main__":
                    help="Weight of vocab proximity regularization (direct mode only)")
     p.add_argument("--lambda_intra", type=float, default=1.0,
                    help="Weight of intra-sequence diversity (penalizes repeated tokens)")
+    p.add_argument("--lambda_target", type=float, default=5.0,
+                   help="Weight of per-position target direction loss (fades with drift warmup)")
 
     # optim
     p.add_argument("--lr", type=float, default=3e-4)
