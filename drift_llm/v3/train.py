@@ -1,9 +1,10 @@
 """
 v3 Text Drifting: unconditional text generation via embedding-space drift loss.
 
-Two feature modes:
+Three feature modes:
+  direct:    Features directly from generator output (no softmax) + vocab proximity reg
   gpt2_soft: Soft embeddings → frozen GPT-2 features (captures sequential structure)
-  emb_stats: Embedding statistics (fast, no model forward, but bag-of-words)
+  emb_stats: Embedding statistics via soft-vocab projection (bag-of-words)
 
 Usage:
     python train.py --mode preprocess
@@ -261,7 +262,7 @@ def train(args):
     if is_main():
         logger.info(f"Features: {args.feature_mode}  "
                      f"R_list={R_list}  C={args.cluster_batch} G={args.G} P={args.P} N={args.N}")
-        logger.info(f"Soft-vocab τ={args.temperature}  λ_div={args.lambda_diversity}")
+        logger.info(f"τ={args.temperature}  λ_div={args.lambda_diversity}  λ_reg={args.lambda_reg}")
         logger.info(f"Training for {args.max_steps} steps …")
 
     # ======================== Main loop ========================
@@ -281,16 +282,25 @@ def train(args):
         noise = torch.randn(C * G, args.seq_len, args.d_model, device=device)
         gen_h = generator(noise)                     # [C*G, L, d_model]  (has grad)
 
-        # Soft vocabulary projection
-        logits = gen_h @ vocab_emb.T                 # [C*G, L, V]
-
         # 3. Features
-        if use_gpt2:
+        if args.feature_mode == "direct":
+            gen_feat = emb_stats_features(gen_h)
+            # Vocab proximity: push each position toward nearest token embedding (cosine)
+            gen_norm = F.normalize(gen_h.reshape(-1, gen_h.shape[-1]), dim=-1)
+            vocab_norm = F.normalize(vocab_emb, dim=-1)
+            cos_sim = gen_norm @ vocab_norm.T          # [C*G*L, V]
+            max_cos = cos_sim.max(dim=-1).values       # [C*G*L]
+            reg_loss = -max_cos.mean()
+        elif args.feature_mode == "gpt2_soft":
+            logits = gen_h @ vocab_emb.T
             gen_feat = gpt2_soft_features(gpt2, logits, vocab_emb, args.temperature, args.top_k)
-        else:
+            reg_loss = torch.tensor(0.0, device=device)
+        else:  # emb_stats
+            logits = gen_h @ vocab_emb.T
             soft_probs = F.softmax(logits / args.temperature, dim=-1)
             gen_emb = soft_probs @ vocab_emb
             gen_feat = emb_stats_features(gen_emb)
+            reg_loss = torch.tensor(0.0, device=device)
         gen_feat = gen_feat.view(C, G, -1)           # [C, G, D_feat]
 
         # 4. Positive / negative from pre-computed bank
@@ -308,7 +318,7 @@ def train(args):
         # 6. Diversity loss: penalize collapse within each cluster
         feat_std = gen_feat.std(dim=1).mean()
         div_loss = -feat_std
-        total_loss = drift_val + args.lambda_diversity * div_loss
+        total_loss = drift_val + args.lambda_diversity * div_loss + args.lambda_reg * reg_loss
 
         # 7. Backward + step
         optimizer.zero_grad()
@@ -321,20 +331,28 @@ def train(args):
             scale = info.get("scale", torch.tensor(0.0))
             scale_val = scale.item() if isinstance(scale, torch.Tensor) else scale
             with torch.no_grad():
-                sp = F.softmax(logits / args.temperature, dim=-1)
-                ent = -(sp * sp.clamp(min=1e-8).log()).sum(-1).mean()
+                if args.feature_mode == "direct":
+                    ent_val = -reg_loss.item()  # mean max cosine sim (higher = closer to vocab)
+                else:
+                    sp = F.softmax(logits / args.temperature, dim=-1)
+                    ent_val = -(sp * sp.clamp(min=1e-8).log()).sum(-1).mean().item()
+            extra = f"max_cos={-reg_loss.item():.3f}" if args.feature_mode == "direct" else f"sm_ent={ent_val:.2f}"
             logger.info(
                 f"step={step:>6}/{args.max_steps}  loss={total_loss.item():.4f}  "
                 f"drift={drift_val.item():.4f}  div={div_loss.item():.4f}  "
-                f"scale={scale_val:.4f}  sm_ent={ent.item():.2f}  "
+                f"reg={reg_loss.item():.4f}  scale={scale_val:.4f}  {extra}  "
                 f"gnorm={grad_norm:.3f}  lr={lr:.2e}"
             )
             if args.wandb_project:
                 import wandb
                 m = {"loss": total_loss.item(), "drift_loss": drift_val.item(),
                      "diversity_loss": div_loss.item(), "feat_std": feat_std.item(),
-                     "softmax_entropy": ent.item(),
+                     "reg_loss": reg_loss.item(),
                      "lr": lr, "grad_norm": grad_norm, "step": step}
+                if args.feature_mode == "direct":
+                    m["mean_max_cosine"] = -reg_loss.item()
+                else:
+                    m["softmax_entropy"] = ent_val
                 for k, v in info.items():
                     m[f"drift/{k}"] = v.item() if isinstance(v, torch.Tensor) else v
                 wandb.log(m)
@@ -366,15 +384,18 @@ def _evaluate(gen, gpt2, vocab_emb, all_feats, token_ids, tok, args, step, devic
     noise = torch.randn(n_samples, args.seq_len, args.d_model, device=device)
     gen_h = gen(noise)                               # [n, L, d_model]
 
-    logits = gen_h @ vocab_emb.T                     # [n, L, V]
-    tokens = logits.argmax(dim=-1)                   # [n, L]
-
-    if args.feature_mode == "gpt2_soft" and gpt2 is not None:
-        emb = vocab_emb[tokens]
-        feats = gpt2(inputs_embeds=emb).last_hidden_state.mean(dim=1)
+    if args.feature_mode == "direct":
+        tokens = gen.decode_to_tokens(gen_h, vocab_emb)
+        feats = emb_stats_features(gen_h)
     else:
-        soft_emb = F.softmax(logits / args.temperature, dim=-1) @ vocab_emb
-        feats = emb_stats_features(soft_emb)
+        logits = gen_h @ vocab_emb.T
+        tokens = logits.argmax(dim=-1)
+        if args.feature_mode == "gpt2_soft" and gpt2 is not None:
+            emb = vocab_emb[tokens]
+            feats = gpt2(inputs_embeds=emb).last_hidden_state.mean(dim=1)
+        else:
+            soft_emb = F.softmax(logits / args.temperature, dim=-1) @ vocab_emb
+            feats = emb_stats_features(soft_emb)
 
     logger.info("─── Generated samples ───")
     table_rows = []
@@ -434,15 +455,17 @@ if __name__ == "__main__":
     p.add_argument("--N", type=int, default=16, help="negative samples per cluster")
     p.add_argument("--cluster_batch", type=int, default=8, help="clusters per step")
     p.add_argument("--R_list", type=float, nargs="+", default=[0.02, 0.05, 0.2])
-    p.add_argument("--feature_mode", type=str, default="gpt2_soft",
-                   choices=["gpt2_soft", "emb_stats"],
-                   help="Feature extraction: gpt2_soft (soft emb → GPT-2) or emb_stats (embedding statistics)")
+    p.add_argument("--feature_mode", type=str, default="direct",
+                   choices=["direct", "gpt2_soft", "emb_stats"],
+                   help="Feature extraction: direct (raw output + vocab reg), gpt2_soft, or emb_stats")
     p.add_argument("--temperature", type=float, default=3.0,
                    help="Softmax temperature for soft-vocab projection (higher=softer)")
     p.add_argument("--top_k", type=int, default=0,
                    help="Top-k logit filtering before softmax (0=disabled, 64 recommended for gpt2_soft)")
     p.add_argument("--lambda_diversity", type=float, default=1.0,
                    help="Weight of diversity regularization loss")
+    p.add_argument("--lambda_reg", type=float, default=0.1,
+                   help="Weight of vocab proximity regularization (direct mode only)")
 
     # optim
     p.add_argument("--lr", type=float, default=3e-4)

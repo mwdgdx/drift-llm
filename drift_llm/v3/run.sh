@@ -31,7 +31,10 @@ CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun \
     --N 16 \
     --cluster_batch 8 \
     --R_list 0.02 0.05 0.2 \
-    --lr 3e-4 \
+    --feature_mode direct \
+    --lambda_diversity 5.0 \
+    --lambda_reg 1.0 \
+    --lr 1e-4 \
     --warmup_steps 1000 \
     --max_steps 50000 \
     --log_every 50 \
