@@ -217,23 +217,30 @@ def train(args):
         del _gpt2
         gpt2 = None
 
+    K_offsets = 128
     with torch.no_grad():
         vn = F.normalize(vocab_emb, dim=-1)
-        target_ids = [torch.randint(0, vocab_emb.shape[0], (1,)).item()]
-        for _ in range(args.seq_len - 1):
-            cur = vn[target_ids]
-            sims = cur @ vn.T
-            min_sim = sims.min(dim=0).values
-            min_sim[target_ids] = float('inf')
-            target_ids.append(min_sim.argmin().item())
-        target_ids = torch.tensor(target_ids, device=device)
-        target_embs = F.normalize(vocab_emb[target_ids], dim=-1)
-        raw_gen.pos_offset.copy_(2.0 * vocab_emb[target_ids])
+        offset_bank = torch.zeros(K_offsets, args.seq_len, vocab_emb.shape[1], device=device)
+        rng = torch.Generator(device='cpu')
+        for k in range(K_offsets):
+            rng.manual_seed(42 + k)
+            start = torch.randint(0, vocab_emb.shape[0], (1,), generator=rng).item()
+            ids_k = [start]
+            for _ in range(args.seq_len - 1):
+                cur = vn[ids_k]
+                sims = cur @ vn.T
+                min_sim = sims.min(dim=0).values
+                min_sim[ids_k] = float('inf')
+                ids_k.append(min_sim.argmin().item())
+            offset_bank[k] = 2.0 * vocab_emb[torch.tensor(ids_k, device=device)]
+        raw_gen.pos_offset.data.zero_()
+        raw_gen.pos_offset.requires_grad_(False)
+        target_embs = F.normalize(offset_bank[0], dim=-1)
     if ddp:
+        dist.broadcast(offset_bank, src=0)
         dist.broadcast(target_embs, src=0)
-        dist.broadcast(raw_gen.pos_offset.data, src=0)
     if is_main():
-        logger.info(f"Selected {args.seq_len} maximally-spread target tokens for position diversity")
+        logger.info(f"Created {K_offsets} pos_offset variants ({args.seq_len} tokens each)")
 
     n_params = sum(p.numel() for p in raw_gen.parameters()) / 1e6
     if is_main():
@@ -300,9 +307,11 @@ def train(args):
         # 1. Sample clusters
         sampled = np.random.choice(valid_clusters, size=C, replace=False)
 
-        # 2. Generate C*G hidden states → soft-vocabulary → embeddings
+        # 2. Generate C*G hidden states → per-sample pos_offset → embeddings
         noise = torch.randn(C * G, args.seq_len, args.d_model, device=device)
         gen_h_raw = generator(noise, body_scale=body_scale)  # [C*G, L, d_model]
+        offset_idx = (noise[:, 0, 0] * 1000).long().abs() % K_offsets
+        gen_h_raw = gen_h_raw + offset_bank[offset_idx]     # per-sample offset
         if args.pos_noise > 0:
             gen_h = gen_h_raw + args.pos_noise * torch.randn_like(gen_h_raw)
         else:
@@ -363,36 +372,12 @@ def train(args):
         target_cos = (gen_h_dir * target_embs.unsqueeze(0)).sum(dim=-1)  # [C*G, L]
         target_loss = -target_cos.mean()
 
-        # 9. STE-based token diversity (hard tokens forward, soft gradient backward)
-        V = vocab_emb.shape[0]
-        ste_temp = 0.2
-        soft_probs = F.softmax(cos_sim / ste_temp, dim=-1)             # [C*G*L, V]
-        with torch.no_grad():
-            hard_idx = cos_sim.argmax(dim=-1, keepdim=True)            # [C*G*L, 1]
-            hard_oh = torch.zeros_like(soft_probs)
-            hard_oh.scatter_(1, hard_idx, 1.0)
-        ste = soft_probs + (hard_oh - soft_probs).detach()             # STE one-hot
-        ste = ste.view(C * G, args.seq_len, V)
-
-        # Inter-sample: per-position entropy of token histogram across samples
-        inter_hist = ste.mean(dim=0)                                   # [L, V]
-        inter_ent = -(inter_hist * inter_hist.clamp(min=1e-8).log()).sum(-1)
-        ste_inter_loss = -inter_ent.mean()
-
-        # Position: per-sample entropy of token histogram across positions
-        pos_hist = ste.mean(dim=1)                                     # [C*G, V]
-        pos_ent = -(pos_hist * pos_hist.clamp(min=1e-8).log()).sum(-1)
-        ste_pos_loss = -pos_ent.mean()
-
-        del soft_probs, hard_oh, ste
-
-        # Curriculum: reg always active; drift ramps in
+        # 9. Total loss — per-sample offsets provide structural diversity
         target_w = 1.0 - drift_w
         total_loss = (drift_w * (drift_val + args.lambda_diversity * div_loss)
                       + args.lambda_reg * reg_loss
-                      + args.lambda_intra * ste_pos_loss
-                      + target_w * args.lambda_target * target_loss
-                      + args.lambda_inter * ste_inter_loss)
+                      + args.lambda_intra * intra_loss
+                      + target_w * args.lambda_target * target_loss)
 
         # 7. Backward + step
         optimizer.zero_grad()
@@ -426,8 +411,7 @@ def train(args):
             logger.info(
                 f"step={step:>6}/{args.max_steps}  loss={total_loss.item():.4f}  "
                 f"drift={drift_val.item():.4f}  div={div_loss.item():.4f}  "
-                f"reg={reg_loss.item():.4f}  ient={inter_ent.mean().item():.2f}  "
-                f"pent={pos_ent.mean().item():.2f}  "
+                f"reg={reg_loss.item():.4f}  "
                 f"pvar={pos_var.item():.4f}  dw={drift_w:.2f}  {extra}  "
                 f"raw_cos={raw_max_cos:.3f}  uniq={mean_uniq:.1f}/{args.seq_len}  "
                 f"iuniq={inter_uniq}  gnorm={grad_norm:.3f}  lr={lr:.2e}"
@@ -437,9 +421,7 @@ def train(args):
                 m = {"loss": total_loss.item(), "drift_loss": drift_val.item(),
                      "diversity_loss": div_loss.item(), "feat_std": feat_std.item(),
                      "reg_loss": reg_loss.item(), "target_loss": target_loss.item(),
-                     "ste_inter_ent": inter_ent.mean().item(),
-                     "ste_pos_ent": pos_ent.mean().item(),
-                     "pos_variance": pos_var.item(),
+                     "intra_loss": intra_loss.item(), "pos_variance": pos_var.item(),
                      "lr": lr, "grad_norm": grad_norm, "step": step}
                 m["mean_max_cosine"] = -reg_loss.item()
                 m["raw_max_cosine"] = raw_max_cos
@@ -454,7 +436,7 @@ def train(args):
         # ---- Eval ----
         if (step % args.eval_every == 0 or step == args.max_steps) and is_main():
             _evaluate(raw_gen, gpt2, vocab_emb, all_features_gpu, token_ids, tok,
-                      args, step, device)
+                      args, step, device, offset_bank)
 
         # ---- Save ----
         if (step % args.save_every == 0 or step == args.max_steps) and is_main():
@@ -471,12 +453,16 @@ def train(args):
 # ======================== Evaluation ========================
 
 @torch.no_grad()
-def _evaluate(gen, gpt2, vocab_emb, all_feats, token_ids, tok, args, step, device):
+def _evaluate(gen, gpt2, vocab_emb, all_feats, token_ids, tok, args, step, device,
+              offset_bank=None):
     gen.eval()
 
     n_samples = 16
     noise = torch.randn(n_samples, args.seq_len, args.d_model, device=device)
     gen_h = gen(noise)                               # [n, L, d_model]
+    if offset_bank is not None:
+        offset_idx = (noise[:, 0, 0] * 1000).long().abs() % offset_bank.shape[0]
+        gen_h = gen_h + offset_bank[offset_idx]
 
     tokens = gen.decode_to_tokens(gen_h, vocab_emb)
     if args.feature_mode in ("gpt2_quantized", "gpt2_direct", "gpt2_soft") and gpt2 is not None:
