@@ -108,6 +108,7 @@ class EmbeddingGenerator(nn.Module):
             nn.Linear(d_model, emb_dim, bias=False) if d_model != emb_dim
             else nn.Identity()
         )
+        self.pos_offset = nn.Parameter(torch.randn(seq_len, emb_dim) * 0.02)
         self._init_weights()
 
     def _init_weights(self):
@@ -130,7 +131,7 @@ class EmbeddingGenerator(nn.Module):
         cos, sin = self.rotary(self.seq_len, device=h.device)
         for block in self.blocks:
             h = block(h, cos, sin)
-        return self.output_proj(self.ln_f(h))
+        return self.output_proj(self.ln_f(h)) + self.pos_offset
 
     @torch.no_grad()
     def decode_to_tokens(self, embeddings, vocab_embeddings):
