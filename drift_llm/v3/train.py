@@ -282,6 +282,8 @@ def train(args):
         # 2. Generate C*G hidden states → soft-vocabulary → embeddings
         noise = torch.randn(C * G, args.seq_len, args.d_model, device=device)
         gen_h = generator(noise)                     # [C*G, L, d_model]  (has grad)
+        if args.pos_noise > 0:
+            gen_h = gen_h + args.pos_noise * torch.randn_like(gen_h)
 
         # 3. Features + vocab proximity reg
         gen_norm = F.normalize(gen_h.reshape(-1, gen_h.shape[-1]), dim=-1)
@@ -491,6 +493,8 @@ if __name__ == "__main__":
     p.add_argument("--grad_clip", type=float, default=5.0)
     p.add_argument("--drift_warmup", type=int, default=3000,
                    help="Steps before drift loss fully activates (curriculum)")
+    p.add_argument("--pos_noise", type=float, default=0.0,
+                   help="Per-position noise added to generator output (breaks position collapse)")
 
     # logging / saving
     p.add_argument("--log_every", type=int, default=50)
