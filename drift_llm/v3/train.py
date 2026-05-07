@@ -330,7 +330,7 @@ def train(args):
         # 7. Backward + step
         optimizer.zero_grad()
         total_loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(generator.parameters(), args.grad_clip)
         optimizer.step()
 
         # ---- Logging ----
@@ -477,6 +477,7 @@ if __name__ == "__main__":
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--max_steps", type=int, default=50000)
+    p.add_argument("--grad_clip", type=float, default=5.0)
 
     # logging / saving
     p.add_argument("--log_every", type=int, default=50)
