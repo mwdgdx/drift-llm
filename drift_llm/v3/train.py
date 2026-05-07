@@ -363,17 +363,28 @@ def train(args):
         target_cos = (gen_h_dir * target_embs.unsqueeze(0)).sum(dim=-1)  # [C*G, L]
         target_loss = -target_cos.mean()
 
-        # 9. Inter-sample diversity: penalize constant transformer body output
-        body_out = gen_h_raw - raw_gen.pos_offset.unsqueeze(0)  # [C*G, L, D]
-        inter_var = body_out.var(dim=0).mean().clamp(min=1e-8)
-        inter_div_loss = -torch.log(inter_var)
+        # 9. Token-level inter-sample diversity
+        # For each position, compute soft token distribution across samples.
+        # High entropy of the mean distribution = different samples pick different tokens.
+        tok_logits = cos_sim / 0.1                               # [C*G*L, V] sharp
+        tok_probs = F.softmax(tok_logits, dim=-1)
+        tok_probs = tok_probs.view(C * G, args.seq_len, -1)     # [C*G, L, V]
+        mean_tok = tok_probs.mean(dim=0)                         # [L, V]
+        tok_ent = -(mean_tok * mean_tok.clamp(min=1e-8).log()).sum(dim=-1)
+        token_div_loss = -tok_ent.mean()
 
-        # Curriculum: phase 1 = target only, phase 2 = drift + reg
+        # Body output variance (for logging only)
+        with torch.no_grad():
+            body_out = gen_h_raw - raw_gen.pos_offset.unsqueeze(0)
+            inter_var = body_out.var(dim=0).mean().clamp(min=1e-8)
+
+        # Curriculum: reg always active; drift ramps in
         target_w = 1.0 - drift_w
-        total_loss = (drift_w * (drift_val + args.lambda_diversity * div_loss + args.lambda_reg * reg_loss)
+        total_loss = (drift_w * (drift_val + args.lambda_diversity * div_loss)
+                      + args.lambda_reg * reg_loss
                       + args.lambda_intra * intra_loss
                       + target_w * args.lambda_target * target_loss
-                      + args.lambda_inter * inter_div_loss)
+                      + args.lambda_inter * token_div_loss)
 
         # 7. Backward + step
         optimizer.zero_grad()
@@ -407,8 +418,8 @@ def train(args):
             logger.info(
                 f"step={step:>6}/{args.max_steps}  loss={total_loss.item():.4f}  "
                 f"drift={drift_val.item():.4f}  div={div_loss.item():.4f}  "
-                f"reg={reg_loss.item():.4f}  tgt={target_loss.item():.4f}  "
-                f"ivar={inter_var.item():.4f}  idiv={inter_div_loss.item():.2f}  "
+                f"reg={reg_loss.item():.4f}  tent={tok_ent.mean().item():.2f}  "
+                f"ivar={inter_var.item():.4f}  "
                 f"pvar={pos_var.item():.4f}  dw={drift_w:.2f}  bs={body_scale:.3f}  {extra}  "
                 f"raw_cos={raw_max_cos:.3f}  uniq={mean_uniq:.1f}/{args.seq_len}  "
                 f"iuniq={inter_uniq}  gnorm={grad_norm:.3f}  lr={lr:.2e}"
