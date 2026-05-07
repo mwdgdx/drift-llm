@@ -217,22 +217,12 @@ def train(args):
         del _gpt2
         gpt2 = None
 
-    K_offsets = 128
+    K_offsets = 1024
     with torch.no_grad():
-        vn = F.normalize(vocab_emb, dim=-1)
-        offset_bank = torch.zeros(K_offsets, args.seq_len, vocab_emb.shape[1], device=device)
-        rng = torch.Generator(device='cpu')
-        for k in range(K_offsets):
-            rng.manual_seed(42 + k)
-            start = torch.randint(0, vocab_emb.shape[0], (1,), generator=rng).item()
-            ids_k = [start]
-            for _ in range(args.seq_len - 1):
-                cur = vn[ids_k]
-                sims = cur @ vn.T
-                min_sim = sims.min(dim=0).values
-                min_sim[ids_k] = float('inf')
-                ids_k.append(min_sim.argmin().item())
-            offset_bank[k] = 2.0 * vocab_emb[torch.tensor(ids_k, device=device)]
+        rng_np = np.random.RandomState(42)
+        offset_indices = rng_np.choice(len(token_ids), K_offsets, replace=False)
+        offset_tokens = token_ids[offset_indices].to(device)
+        offset_bank = 2.0 * vocab_emb[offset_tokens]
         raw_gen.pos_offset.data.zero_()
         raw_gen.pos_offset.requires_grad_(False)
         target_embs = F.normalize(offset_bank[0], dim=-1)
