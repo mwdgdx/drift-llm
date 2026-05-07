@@ -375,11 +375,13 @@ def train(args):
         target_cos = (gen_h_dir * target_embs.unsqueeze(0)).sum(dim=-1)  # [C*G, L]
         target_loss = -target_cos.mean()
 
-        # 9. Total loss — per-sample offsets provide structural diversity
+        # 9. Total loss — gate intra_weight by body_scale:
+        #    small body → offsets handle diversity, strong body → intra prevents collapse
         target_w = 1.0 - drift_w
+        intra_w = body_scale * args.lambda_intra
         total_loss = (drift_w * (drift_val + args.lambda_diversity * div_loss)
                       + args.lambda_reg * reg_loss
-                      + args.lambda_intra * intra_loss
+                      + intra_w * intra_loss
                       + target_w * args.lambda_target * target_loss)
 
         # 7. Backward + step
