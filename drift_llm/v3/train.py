@@ -2,7 +2,7 @@
 v3 Text Drifting: unconditional text generation via embedding-space drift loss.
 
 Two feature modes:
-  gpt2_ste: STE + frozen GPT-2 features (meaningful sequential features, good gradients)
+  gpt2_soft: Soft embeddings → frozen GPT-2 features (captures sequential structure)
   emb_stats: Embedding statistics (fast, no model forward, but bag-of-words)
 
 Usage:
@@ -143,16 +143,14 @@ def emb_stats_features(embeddings, n_chunks=8):
     return torch.cat(parts, dim=-1)
 
 
-def gpt2_ste_features(gpt2, logits, vocab_emb, temperature):
-    """STE + GPT-2: hard tokens in forward (meaningful features), soft gradient in backward.
+def gpt2_soft_features(gpt2, logits, vocab_emb, temperature):
+    """Soft embeddings → frozen GPT-2 → mean pool.
 
-    Forward: argmax → real token embeddings → GPT-2 → mean pool (768-dim)
-    Backward: gradient flows through soft_emb via straight-through estimator
+    At moderate τ (2-5), soft_emb is peaked enough for GPT-2 to produce
+    meaningful features while retaining gradient flow through softmax.
     """
     soft_emb = F.softmax(logits / temperature, dim=-1) @ vocab_emb
-    hard_emb = vocab_emb[logits.argmax(dim=-1)]
-    ste_emb = hard_emb + (soft_emb - soft_emb.detach())
-    h = gpt2(inputs_embeds=ste_emb).last_hidden_state
+    h = gpt2(inputs_embeds=soft_emb).last_hidden_state
     return h.mean(dim=1)
 
 
@@ -200,9 +198,9 @@ def train(args):
         generator = DDP(generator, device_ids=[local_rank])
     raw_gen = generator.module if ddp else generator
 
-    use_gpt2_ste = (args.feature_mode == "gpt2_ste")
+    use_gpt2 = (args.feature_mode == "gpt2_soft")
 
-    if use_gpt2_ste:
+    if use_gpt2:
         gpt2 = GPT2Model.from_pretrained("gpt2").to(device).eval()
         for p in gpt2.parameters():
             p.requires_grad = False
@@ -218,7 +216,7 @@ def train(args):
         logger.info(f"Generator: {n_params:.1f}M params  |  Feature mode: {args.feature_mode}")
 
     # ---- Memory bank features ----
-    if use_gpt2_ste:
+    if use_gpt2:
         all_features = data["features"]  # pre-computed GPT-2 mean pool (768-dim)
         all_features_gpu = all_features.to(device)
         D_feat = all_features.shape[1]
@@ -283,8 +281,8 @@ def train(args):
         logits = gen_h @ vocab_emb.T                 # [C*G, L, V]
 
         # 3. Features
-        if use_gpt2_ste:
-            gen_feat = gpt2_ste_features(gpt2, logits, vocab_emb, args.temperature)
+        if use_gpt2:
+            gen_feat = gpt2_soft_features(gpt2, logits, vocab_emb, args.temperature)
         else:
             soft_probs = F.softmax(logits / args.temperature, dim=-1)
             gen_emb = soft_probs @ vocab_emb
@@ -367,7 +365,7 @@ def _evaluate(gen, gpt2, vocab_emb, all_feats, token_ids, tok, args, step, devic
     logits = gen_h @ vocab_emb.T                     # [n, L, V]
     tokens = logits.argmax(dim=-1)                   # [n, L]
 
-    if args.feature_mode == "gpt2_ste" and gpt2 is not None:
+    if args.feature_mode == "gpt2_soft" and gpt2 is not None:
         emb = vocab_emb[tokens]
         feats = gpt2(inputs_embeds=emb).last_hidden_state.mean(dim=1)
     else:
@@ -432,10 +430,10 @@ if __name__ == "__main__":
     p.add_argument("--N", type=int, default=16, help="negative samples per cluster")
     p.add_argument("--cluster_batch", type=int, default=8, help="clusters per step")
     p.add_argument("--R_list", type=float, nargs="+", default=[0.02, 0.05, 0.2])
-    p.add_argument("--feature_mode", type=str, default="gpt2_ste",
-                   choices=["gpt2_ste", "emb_stats"],
-                   help="Feature extraction: gpt2_ste (STE + GPT-2) or emb_stats (embedding statistics)")
-    p.add_argument("--temperature", type=float, default=1.0,
+    p.add_argument("--feature_mode", type=str, default="gpt2_soft",
+                   choices=["gpt2_soft", "emb_stats"],
+                   help="Feature extraction: gpt2_soft (soft emb → GPT-2) or emb_stats (embedding statistics)")
+    p.add_argument("--temperature", type=float, default=3.0,
                    help="Softmax temperature for soft-vocab projection (higher=softer)")
     p.add_argument("--lambda_diversity", type=float, default=1.0,
                    help="Weight of diversity regularization loss")
