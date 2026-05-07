@@ -217,6 +217,12 @@ def train(args):
         del _gpt2
         gpt2 = None
 
+    with torch.no_grad():
+        sampled_tok = torch.randint(0, vocab_emb.shape[0], (args.seq_len,))
+        raw_gen.pos_offset.copy_(vocab_emb[sampled_tok])
+    if is_main():
+        logger.info(f"Initialized pos_offset from {args.seq_len} random token embeddings")
+
     n_params = sum(p.numel() for p in raw_gen.parameters()) / 1e6
     if is_main():
         logger.info(f"Generator: {n_params:.1f}M params  |  Feature mode: {args.feature_mode}")
