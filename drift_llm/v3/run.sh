@@ -36,6 +36,7 @@ CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun \
     --lambda_reg 10.0 \
     --lambda_intra 0.5 \
     --lambda_target 5.0 \
+    --lambda_inter 1.0 \
     --drift_warmup 3000 \
     --pos_noise 0.2 \
     --grad_clip 5.0 \
@@ -45,6 +46,5 @@ CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun \
     --log_every 50 \
     --eval_every 2000 \
     --save_every 10000 \
-    --output_dir runs/v3 \
-    --cache_dir data/v3_cache \
-    --wandb_project drift-llm-v3
+    --output_dir runs/v3_inter \
+    --cache_dir data/v3_cache
